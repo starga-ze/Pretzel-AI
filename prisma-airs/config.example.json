@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to config.json and fill in api_key, or leave it empty and export PZ_PORTKEY_API_KEY. The provider is selected through the model field as @<integration-slug>/<model>, per Portkey's SDK; no x-portkey-provider header is needed.",
+  "gateway": {
+    "id": "portkey",
+    "host": "aigw.portkey.ai",
+    "port": 443,
+    "tls": true,
+    "path": "/v1/chat/completions",
+    "api_key_header": "x-portkey-api-key",
+    "api_key": "",
+    "models": [
+      { "id": "@openai/gpt-4o-2024-11-20", "label": "GPT-4o" }
+    ],
+    "default_model": "@openai/gpt-4o-2024-11-20",
+    "headers": {},
+    "system_prompt": "You are the internal assistant for this company. Answer in the language the user writes in. If you do not know, say so rather than guessing.",
+    "max_tokens": 512,
+    "timeout_sec": 45
+  }
+}

@@ -1,0 +1,4 @@
+# Pinned to the same gRPC version the pretzel repo vendors for the C++ side
+# (script/utils.py GRPC_VERSION), so the protobuf runtime and wire format match on both ends.
+grpcio==1.62.1
+grpcio-tools==1.62.1

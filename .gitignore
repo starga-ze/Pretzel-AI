@@ -1,0 +1,15 @@
+# virtualenv created by `./pretzel-ai install`
+.venv/
+
+# python bytecode
+__pycache__/
+*.py[cod]
+
+# gRPC stubs generated from proto/ by `./pretzel-ai build`
+src/inference_pb2.py
+src/inference_pb2_grpc.py
+
+# The live gateway config: it holds the API key, so it stays out of the repo.
+# Copy config.example.json to config.json and fill it in, or leave the key empty
+# there and supply PZ_PORTKEY_API_KEY in the environment.
+prisma-airs/config.json

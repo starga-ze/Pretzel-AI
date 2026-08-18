@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""pretzel-ai CLI — the same shape as pretzel's ./pretzel dispatcher.
+
+    ./pretzel-ai install   # venv + deps + generated stubs + /var/log/pretzel-ai
+    ./pretzel-ai build     # regenerate the gRPC stubs from proto/
+    ./pretzel-ai start     # run the inference daemon under systemd (infinite loop)
+    ./pretzel-ai stop      # stop + disable the daemon
+    ./pretzel-ai clean     # remove generated stubs and caches
+"""
+import importlib.util
+import os
+import sys
+
+# Never leave .pyc caches behind. install/start/stop re-exec this under sudo, and any bytecode
+# written there would be root-owned — which is exactly what makes a later unprivileged
+# `./pretzel-ai clean` (or any plain run) fail with EACCES. Set before importing the script
+# modules so it covers their imports too; it carries across the sudo re-exec since that re-runs
+# this file from the top.
+sys.dont_write_bytecode = True
+
+COMMAND_MAP = {
+    "build": "script/build.py",
+    "install": "script/install.py",
+    "start": "script/start.py",
+    "stop": "script/stop.py",
+    "clean": "script/clean.py",
+}
+
+# install/start/stop write /var/log/pretzel-ai and the systemd unit — both root-owned.
+NEED_ROOT = {"install", "start", "stop"}
+
+
+def ensure_root(cmd):
+    if cmd not in NEED_ROOT or os.geteuid() == 0:
+        return
+    print(f"[*] The '{cmd}' command requires root privileges. Restarting with sudo ...")
+    os.execvp("sudo", ["sudo", sys.executable, sys.argv[0]] + sys.argv[1:])
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: ./pretzel-ai [build|install|start|stop|clean]")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    ensure_root(cmd)
+
+    module_file = COMMAND_MAP.get(cmd)
+    if not module_file:
+        print("[*] Error, unknown command:", cmd)
+        sys.exit(1)
+
+    root = os.path.abspath(os.path.dirname(__file__))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+    path = os.path.join(root, module_file)
+    name = module_file.replace("/", "_").replace(".py", "")
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:
+        print(f"[Error] Failed to load {module_file}: {e}")
+        sys.exit(1)
+
+    if not hasattr(module, "run"):
+        print(f"[*] Error, {module_file} has no run() function")
+        sys.exit(1)
+    module.run()
+
+
+if __name__ == "__main__":
+    main()
