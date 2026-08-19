@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+package pretzel.ai.v1;
+
+// The mgmtd <-> pretzel-ai contract. Source of truth; mirrored into pretzel/mgmtd/grpc/.
+// The mgmtd <-> pretzel-ai contract. mgmtd is the client (a person typing in the console);
+// pretzel-ai is the server. Named for the service, not for one of its calls: it answers chat
+// turns and it owns the tech-doc corpus behind them, so "Inference" stopped describing it. Streaming from the start: a chat turn comes back token-by-token so the console can
+// render the answer as it arrives rather than after the whole thing is built.
+service PretzelAi {
+  // One chat turn. The reply is a stream of chunks; the final chunk has done=true and carries
+  // the turn-level outcome (usage, and later the AIRS scan verdict — see the old
+  // gateway_service.extract_scan for the shape those fields will take).
+  rpc Chat(ChatRequest) returns (stream ChatChunk);
+
+  // --- The tech-doc knowledge base -------------------------------------------------------
+  //
+  // The assistant answers out of a corpus crawled from docs.paloaltonetworks.com, and Palo Alto
+  // republishes those docs continuously, so keeping it current is an operation the console has
+  // to expose rather than a one-off import. It is split in two on purpose: Check is cheap (one
+  // sitemap fetch) and tells the operator what a refresh would do, so Refresh is never a blind
+  // 21,768-page download.
+
+  // What has moved since the last crawl. Seconds, no page bodies fetched.
+  rpc CheckCorpus(CheckCorpusRequest) returns (CorpusCheck);
+
+  // Apply those changes. Streams progress because it runs for minutes and the console holds a
+  // window open for it; the stream is also the cancellation channel — mgmtd stops reading and
+  // the crawl stops.
+  rpc RefreshCorpus(RefreshCorpusRequest) returns (stream RefreshProgress);
+
+  // What is in the store right now, for the card's resting state.
+  rpc GetCorpusStatus(CorpusStatusRequest) returns (CorpusStatus);
+}
+
+message ChatRequest {
+  string model = 1;          // "" -> the server's default model
+  string message = 2;        // the person's turn
+  string system_prompt = 3;  // optional override; "" -> server default
+}
+
+message ChatChunk {
+  string delta = 1;   // text produced since the previous chunk (empty on the final chunk)
+  bool   done = 2;    // true exactly once, on the last chunk
+  string error = 3;   // set only when the turn failed; done is also true in that case
+
+  // On the final chunk (done=true): the complete turn document as JSON — reply, the AIRS scan
+  // verdict, usage, ok/code — the same shape the old inferd ChatResponse IPC payload carried,
+  // which mgmtd files verbatim and the console parses. Empty on non-final chunks.
+  string result_json = 4;
+}
+
+// --- Tech-doc corpus ---------------------------------------------------------------------
+
+message CheckCorpusRequest {
+  string scope = 1;   // one product ("ngfw"); "" -> the whole sitemap
+}
+
+// One pending unit of work, as the console lists it for the operator to look at before
+// confirming. `kind` is added | changed | removed.
+message DocChange {
+  string url = 1;
+  string kind = 2;   // added | changed | retry | removed
+  string product = 3;
+  string version = 4;   // "" when the URL carries no version segment
+  string docset = 5;
+  string lastmod = 6;            // ISO-8601, from the sitemap
+  string previous_lastmod = 7;   // what the store had; "" for a page never seen before
+  string title = 8;              // "" for a page never fetched, which is every newly added one
+}
+
+// Changes folded onto the product/docset tree the URLs imply.
+//
+// The sitemap itself is 22,519 flat <loc> entries carrying a timestamp and nothing else — no
+// titles, no hierarchy, no grouping. Handing that back to an operator as a list of URLs asks them
+// to read structure out of path strings. The grouping is derived here so the console can say
+// "PAN-OS / Administration: 12 changed" and leave the URLs underneath it.
+message ChangeGroup {
+  string product = 1;
+  string docset  = 2;
+  string version = 3;
+  int32 added    = 4;
+  int32 changed  = 5;
+  int32 removed  = 6;
+  int32 retry    = 7;
+}
+
+message CorpusCheck {
+  int32 total_in_scope = 1;
+  int32 added   = 2;
+  int32 changed = 3;
+  int32 removed = 4;
+  // Pages the last crawl could not read, not pages that changed. Counted apart because they are a
+  // different fact about the appliance: "we owe these a retry", not "the documentation moved".
+  int32 retry   = 9;
+  // Capped: the operator needs to see what kind of change this is, not read 21,768 URLs. The
+  // counts above are the complete answer; this is the sample under them.
+  repeated DocChange changes = 5;
+  bool truncated = 6;
+  string error = 7;
+  repeated ChangeGroup groups = 8;   // complete; `changes` is only a sample
+}
+
+message RefreshCorpusRequest {
+  string scope = 1;
+}
+
+// Emitted every batch. skipped_304 and skipped_same_sha are reported apart from `fetched` on
+// purpose: together they are the evidence that a refresh reporting "12 changed" still looked at
+// everything in scope.
+message RefreshProgress {
+  string stage = 1;   // start | tombstone | fetch | done | failed
+  int32 done  = 2;
+  int32 total = 3;
+
+  int32 fetched          = 4;
+  int32 added            = 5;
+  int32 changed          = 6;
+  int32 removed          = 7;
+  int32 skipped_304      = 8;
+  int32 skipped_same_sha = 9;
+  int32 failed           = 10;
+  int32 skipped_alias    = 14;   // resolved from a redirect target already fetched this run
+
+  bool   final = 11;   // true exactly once, on the last message
+  string error = 12;   // set only when the run failed; final is also true in that case
+  int64  run_id = 13;
+}
+
+message CorpusStatusRequest {}
+
+// One row of the product/docset tree the corpus actually contains.
+//
+// The sitemap has no hierarchy — 22,519 flat URLs — so this is derived from the URL paths, and it
+// is the only structured view of the corpus that exists anywhere. 64 products, 321 docsets: small
+// enough to send whole, which is what lets the console render a browsable tree instead of a count.
+message ProductStat {
+  string product   = 1;
+  string docset    = 2;
+  int32  documents = 3;
+  int32  bodies    = 4;
+  int64  chars     = 5;
+  int32  versions  = 6;
+  int32  failed    = 7;
+}
+
+message CorpusStatus {
+  int32  documents  = 1;   // live, excluding tombstones
+  int32  tombstoned = 2;
+  int32  bodies     = 3;   // distinct content rows; documents/bodies is the dedup ratio
+  int64  chars      = 4;
+  string last_run_at     = 5;
+  string last_run_status = 6;
+  int64  last_run_id     = 7;
+  string error = 8;
+  repeated ProductStat products = 9;
+}

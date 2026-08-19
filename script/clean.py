@@ -4,7 +4,7 @@ import glob
 import os
 import sys
 
-from script.utils import ROOT_DIR, PKG_DIR
+from script.utils import ROOT_DIR, GRPC_DIR
 
 
 def _rm(path):
@@ -27,8 +27,8 @@ def _rm(path):
 def run():
     removed = 0
 
-    for name in ("inference_pb2.py", "inference_pb2_grpc.py"):
-        removed += _rm(os.path.join(PKG_DIR, name))
+    for name in ("pretzel_ai_pb2.py", "pretzel_ai_pb2_grpc.py"):
+        removed += _rm(os.path.join(GRPC_DIR, name))
 
     for cache in glob.glob(os.path.join(ROOT_DIR, "**", "__pycache__"), recursive=True):
         if ".venv" in cache:

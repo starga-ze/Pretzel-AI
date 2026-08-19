@@ -11,7 +11,7 @@ def run():
     subprocess.run(["systemctl", "stop", SERVICE_NAME])
     subprocess.run(["systemctl", "disable", SERVICE_NAME])
     # Belt and suspenders: a manually-launched instance is not managed by the unit.
-    subprocess.run(["pkill", "-f", "src.server"])
+    subprocess.run(["pkill", "-f", "src.grpc.server"])
     print(f"[*] {SERVICE_NAME} stopped and disabled.")
 
 

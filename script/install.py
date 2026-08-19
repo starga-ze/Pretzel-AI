@@ -52,6 +52,7 @@ def run():
     # The venv was created under sudo; hand it back so `./pretzel-ai build` (unprivileged) can use it.
     _chown_to_user(VENV_DIR)
 
+    # Unconditional here: install is the fresh-checkout path, where there is nothing to be stale.
     build.run()
     _chown_to_user(os.path.join(ROOT_DIR, "src"))
 

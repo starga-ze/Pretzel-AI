@@ -50,15 +50,38 @@ return `UNREACHABLE`.
 ## Layout
 
 ```
-pretzel-ai                   the CLI dispatcher
-script/                      build / install / start / stop / clean
-proto/inference.proto        the mgmtd <-> pretzel-ai contract (source of truth)
-src/server.py         the gRPC streaming server
-src/gateway.py        the AIRS gateway call + scan-verdict extraction
-src/config.py         loads prisma-airs/config.json → gateway config
-src/log.py            rotating file log at /var/log/pretzel-ai
+pretzel-ai                       the CLI dispatcher
+script/                          build / install / start / stop / clean
+src/grpc/pretzel_ai.proto        the mgmtd <-> pretzel-ai contract (source of truth,
+                                 mirrored into pretzel/mgmtd/grpc/)
+src/grpc/server.py               the gRPC server: Chat + the corpus operations
+src/gateway.py                   the AIRS gateway call + scan-verdict extraction
+src/config.py                    loads prisma-airs/config.json → gateway config
+src/log.py                       rotating file log at /var/log/pretzel-ai
+src/crawler/                     the tech-doc crawler (sitemap → fetch → extract → store)
+sql/001_techdoc.sql              the pretzel_knowledge schema
 prisma-airs/config.example.json  template for the gateway config (copy to config.json)
 ```
+
+`src/grpc/` holds everything gRPC — the contract, the stubs `build` generates beside it, and the
+server. It is a package inside `src` rather than a directory at the repo root because a top-level
+`grpc/` would shadow grpcio's own module for anything that put the root on sys.path.
+
+## The tech-doc corpus
+
+The assistant answers out of `pretzel_knowledge`, crawled from docs.paloaltonetworks.com. Two
+schemas: `techdoc` (crawled, expensive to reacquire, back this up) and `corpus` (chunks and
+embeddings, derived, rebuilt whenever the chunking rules or the model change).
+
+```bash
+python -m src.crawler check                  # what has moved since the last crawl
+python -m src.crawler refresh --scope ngfw   # apply it
+python -m src.crawler status                 # what the store holds
+```
+
+The console drives the same operations from **System Management ▸ Operation ▸ Tech Documentation**.
+The CLI is for the first full build, which fetches every page and is a job to leave running in a
+terminal rather than to hold a browser window open for.
 
 ## Status
 

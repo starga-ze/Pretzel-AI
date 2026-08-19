@@ -2,3 +2,9 @@
 # (script/utils.py GRPC_VERSION), so the protobuf runtime and wire format match on both ends.
 grpcio==1.62.1
 grpcio-tools==1.62.1
+
+# The tech-doc knowledge base (pretzel_knowledge). psycopg 3 rather than psycopg2: it ships a
+# binary wheel for 3.10, and its pipeline/COPY support is what makes a 21k-page crawl write in
+# reasonable time. pretzel-ai is the sole writer of this database; engined remains the sole
+# writer of the `pretzel` configuration database.
+psycopg[binary]==3.2.3

@@ -12,8 +12,10 @@ VENV_PY = os.path.join(VENV_DIR, "bin", "python")
 VENV_PIP = os.path.join(VENV_DIR, "bin", "pip")
 REQUIREMENTS = os.path.join(ROOT_DIR, "requirements.txt")
 
-PROTO_FILE = os.path.join(ROOT_DIR, "proto", "inference.proto")
-PROTO_DIR = os.path.join(ROOT_DIR, "proto")
+# The gRPC edge: the contract and its generated stubs live together, mirroring mgmtd/grpc/.
+GRPC_DIR = os.path.join(ROOT_DIR, "src", "grpc")
+PROTO_FILE = os.path.join(GRPC_DIR, "pretzel_ai.proto")
+PROTO_DIR = GRPC_DIR
 PKG_DIR = os.path.join(ROOT_DIR, "src")
 
 CONFIG_FILE = os.path.join(ROOT_DIR, "prisma-airs", "config.json")
