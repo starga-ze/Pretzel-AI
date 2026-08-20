@@ -42,8 +42,12 @@ def extract_scan(doc):
 
     categories, masked = [], {}
     present = any_fail = denied = any_async = transformed = timed_out = errored = False
+    # A check can fail two ways and they are not the same fact: it can rule against the turn, or it
+    # can never rule at all because the call to AIRS itself errored. `ruled` says at least one check
+    # came back with a verdict on the content; `check_error` says at least one did not.
+    ruled = check_error = False
     latency = 0
-    profile = profile_id = scan_id = report_id = action = ""
+    profile = profile_id = scan_id = report_id = action = error_detail = ""
 
     for key, direction in _PHASES:
         for hook in hooks.get(key) or []:
@@ -60,9 +64,24 @@ def extract_scan(doc):
             latency = max(latency, hook.get("execution_time") or 0)
 
             for check in hook.get("checks") or []:
-                data = check.get("data") if isinstance(check, dict) else None
+                if not isinstance(check, dict):
+                    continue
+
+                # An errored check is read BEFORE its data, because it has none. Portkey reports the
+                # failure here and, with fail_on_error off, still lets the turn through with the
+                # hook's own verdict left true — so a guardrail that never ran looks identical to
+                # one that ran and cleared, unless this branch is the one that speaks.
+                err = check.get("error")
+                if err:
+                    check_error = True
+                    if not error_detail:
+                        error_detail = (err.get("message", "") if isinstance(err, dict)
+                                        else str(err))[:200]
+
+                data = check.get("data")
                 if not isinstance(data, dict):
                     continue
+                ruled = True
 
                 profile = profile or data.get("profile_name", "")
                 profile_id = profile_id or data.get("profile_id", "")
@@ -98,12 +117,20 @@ def extract_scan(doc):
     if not present:
         return scan  # the guardrail was not on this call's path
 
-    # Three states, not two. "flagged" is the one a boolean would hide: AIRS found something and
-    # the gateway forwarded it anyway (deny off, or an async guardrail, which cannot deny whatever
-    # it found).
+    # Four states, not two. "flagged" is one a boolean would hide: AIRS found something and the
+    # gateway forwarded it anyway (deny off, or an async guardrail, which cannot deny whatever it
+    # found). "not_inspected" is the other, and it is the dangerous one: the hook ran, the call to
+    # AIRS errored, fail_on_error was off, and the turn went upstream uninspected. Reported as
+    # "allow" that is a green light on a control that never looked — the one reading of this
+    # payload that is worse than no reading at all.
+    if check_error and not ruled:
+        verdict = "not_inspected"
+    else:
+        verdict = "allow" if not any_fail else ("block" if denied else "flagged")
+
     scan.update({
         "present": True,
-        "verdict": "allow" if not any_fail else ("block" if denied else "flagged"),
+        "verdict": verdict,
         "enforced": denied,
         "async": any_async,
         "action": action,
@@ -113,9 +140,12 @@ def extract_scan(doc):
         "report_id": report_id,
         "latency_ms": latency,
         "timeout": timed_out,
-        "error": errored,
+        "error": errored or check_error,
         "categories": categories,
     })
+    # Only when there is one: an absent key reads as "nothing went wrong", which is true here.
+    if error_detail:
+        scan["error_detail"] = error_detail
     if masked:
         masked["applied"] = transformed
         scan["masked"] = masked
@@ -143,11 +173,28 @@ class GatewayService:
             return requested, ""
         return "", f"unknown model '{requested}'"
 
-    def build_messages(self, message, system_prompt=None):
+    def build_messages(self, message, system_prompt=None, history=None):
+        """system prompt, then the conversation so far, then this turn.
+
+        History goes in as user/assistant pairs rather than folded into the system prompt or into
+        `message`, and the difference is not cosmetic here: the AIRS guardrail's scan scope is
+        `last_message`, so only the final entry is inspected. Anything appended to the system
+        prompt is therefore never scanned at all — measured, not assumed — which makes "put the
+        context in the system prompt" the one arrangement that hides it from the control.
+        """
         messages = []
         prompt = system_prompt if system_prompt is not None else self._gw.get("system_prompt", "")
         if prompt:
             messages.append({"role": "system", "content": prompt})
+
+        for turn in history or []:
+            role = (turn.get("role") or "").strip()
+            content = turn.get("content") or ""
+            # An unknown role is dropped rather than coerced to "user": a mislabelled assistant turn
+            # replayed as the person's own words rewrites what the model thinks it already said.
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+
         messages.append({"role": "user", "content": message})
         return messages
 
@@ -192,7 +239,7 @@ class GatewayService:
             "credential_id": provider,
         }, ""
 
-    def complete(self, model, messages):
+    def complete(self, model, messages, session_id=""):
         """Returns the response document the console consumes, whatever happened."""
         started = time.monotonic()
         out = {"model": model}
@@ -238,6 +285,15 @@ class GatewayService:
         # Operator-declared extras last, so config can override anything above.
         headers.update(self._gw.get("headers") or {})
 
+        # The conversation id, and the only way to set one. Portkey forwards this header to Prisma
+        # AIRS as the scan's tr_id, which is what AIRS groups its Sessions view by; the guardrail's
+        # own settings expose no per-request field for it. Undocumented on both sides and verified
+        # against the live gateway: the tr_id that comes back equals whatever is sent here, and the
+        # prompt-side and response-side scans of a turn share it. Sent last so it cannot be
+        # clobbered by a stale operator-declared header of the same name.
+        if session_id:
+            headers["x-portkey-trace-id"] = session_id
+
         status, raw, transport_error = 0, "", ""
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -281,9 +337,20 @@ class GatewayService:
             err_msg = doc.get("message", "") or "the gateway rejected the request"
             err_type = err_type or "gateway_rejected"
 
+        # A denial does not always arrive as 446. With soft deny the gateway answers 200 with a
+        # well-formed completion whose content is the guardrail's own failure text — no error
+        # object, no distinguishing status — so a reader that keys only on 446 files a blocked turn
+        # as a successful one and hands the operator an English internal message dressed as the
+        # model's answer. The hook says what really happened, so ask it: deny, or softDeny200.
+        soft_denied = False
+        for key, _ in _PHASES:
+            for hook in (doc.get("hook_results") or {}).get(key) or []:
+                if isinstance(hook, dict) and (hook.get("deny") or hook.get("softDeny200")):
+                    soft_denied = True
+
         # 446 is the gateway's documented guardrail-denial status and `hooks_failed` the error type
         # that rides with it. NOT a failure of the appliance: it is the control working.
-        if status == 446 or err_type == "hooks_failed":
+        if status == 446 or err_type == "hooks_failed" or soft_denied:
             out.update({"ok": False, "code": "BLOCKED",
                         "error": err_msg or "the guardrail denied this turn"})
             log.info("chat turn blocked by guardrail (status=%s, scan_id=%s)",
@@ -315,7 +382,7 @@ class GatewayService:
             out["usage"] = doc["usage"]
         return out
 
-    def complete_turn(self, model_req, message, system_prompt=None):
+    def complete_turn(self, model_req, message, system_prompt=None, history=None, session_id=""):
         """One non-retrieval turn: resolve the model, build the messages, call the gateway.
 
         Retrieval/grounding (the old chat_service.handle_turn) is intentionally not ported here —
@@ -329,4 +396,6 @@ class GatewayService:
         if model_err:
             return {"ok": False, "code": "BAD_REQUEST", "error": model_err}
 
-        return self.complete(model, self.build_messages(message, system_prompt or None))
+        return self.complete(model,
+                             self.build_messages(message, system_prompt or None, history),
+                             session_id)

@@ -1,292 +1,198 @@
-"""check() and refresh(): the two operations the console card drives.
+"""The crawl: fetch every page the sitemap lists, keep the ones that are documents.
 
-check() is cheap — one sitemap fetch and one query — and answers "what would a refresh do".
-The console shows that answer to the operator before anything is downloaded, so a refresh is
-never a blind 21,768-page fetch.
+There is one operation and no incremental path. Every run re-reads the sitemap and re-fetches
+everything on it, which is slower than comparing timestamps and very much simpler: nothing is
+remembered between runs, so nothing between runs can be wrong. The staleness gates that used to
+live here were correct and still cost a schema of their own — lastmod, ETag, content hashes,
+redirect markers — and each one was a place the store could disagree with the site.
 
-refresh() is the expensive half, and is written as a generator that yields progress rather than
-returning at the end. That shape is what lets the gRPC layer stream RefreshProgress to the
-console while the work runs, and it is also what makes the operation interruptible: the caller
-stops consuming and the crawl stops.
+What survives a crawl is what a reader can use: a URL with a title, a body, and a date. Everything
+else is dropped at the point it is recognised rather than stored with a flag:
 
-The three gates, in the order they cost money:
+  404 / unreachable   the sitemap lists pages Palo Alto has removed
+  redirect            whole URL subtrees 301 onto one page; the target is what gets stored, once
+  no usable body      the content root is missing or renders to nothing (JS-built landing pages)
+  no title            nothing was served to read one from
+  nothing but its own headings  a section landing page: matches every query about its product,
+                                answers none
+  a top-level path    /dns-security, /hardware, /traps and forty-odd others are product landing
+                      pages — marketing copy and a table of contents. /sitemap is on that list
+                      too, and had put 939,897 characters of sitemap XML into the corpus.
 
-  1. sitemap lastmod   — free (already fetched). Says a page *might* have moved.
-  2. If-Modified-Since — one request, no body on a 304. Says whether the server agrees.
-  3. sha256 of text    — the only one that decides. lastmod moves in wholesale republishes
-                         (two dozen pages sharing a timestamp to the second), so without this
-                         gate a refresh re-derives everything downstream for pages whose text
-                         is byte-identical to what is already stored.
-
-Ahead of all three sits redirect collapsing. Whole subtrees of this site 301 onto a single page —
-110 URLs under one custom-signature-contexts branch land on the same Advanced Threat Prevention
-document — and once a previous crawl has recorded where an alias ends, refetching it is downloading
-a page this run already has. Aliases are resolved from their target's result instead.
+Progress is yielded rather than returned so the gRPC layer can stream it, and so the caller can
+stop consuming to cancel.
 """
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from src.crawler import sitemap, store
-from src.crawler.fetch import Result, fetch
+from src.crawler.extract import residual
+from src.crawler.fetch import fetch, probe
+
+BASE = "https://docs.paloaltonetworks.com"
 
 log = logging.getLogger("pretzel-ai.crawler.pipeline")
 
-# Network-bound, so more workers than cores — but lower than it was. Eight sustained workers drew
-# rate-limiting from docs.paloaltonetworks.com on a full crawl (155 pages came back 403 and were
-# serving normally on a later request), and the retry backoff only cleans that up after the fact.
-# The crawl is never the priority here: it runs on an appliance beside a live assistant, and half
-# an hour versus forty minutes is not worth being throttled for.
+# Network-bound, so more workers than cores — but low enough not to draw rate limiting. Eight
+# sustained workers had docs.paloaltonetworks.com answering 403 to 155 pages that were serving
+# normally minutes later. The crawl is never the priority: it runs beside a live assistant.
 FETCH_WORKERS = 5
 
+# The survey uses the same restraint but moves ~3x faster: HEAD carries no body.
+PROBE_WORKERS = 5
 
-class Change:
-    """One pending unit of work, as shown to the operator before they confirm."""
-
-    __slots__ = ("url", "kind", "product", "version", "docset", "section_path",
-                 "lastmod", "previous_lastmod", "unconditional", "title")
-
-    def __init__(self, url, kind, facets, lastmod, previous_lastmod=None,
-                 unconditional=False, title=None):
-        self.url = url
-        # Set when this page is being refetched because what is stored is unusable rather than
-        # because the sitemap moved. Such a fetch must not be conditional: the server would answer
-        # 304 — correctly, nothing changed — and the unusable copy would survive the retry that
-        # existed to replace it.
-        self.unconditional = unconditional
-        # added | changed | retry | removed. `retry` is deliberately not `changed`: the page did
-        # not change, we failed to read it. Reporting 220 unreadable pages as 220 edits tells the
-        # operator the documentation moved under them when what actually happened is that a crawl
-        # got throttled.
-        self.kind = kind
-        self.product = facets["product"]
-        self.version = facets["version"]
-        self.docset = facets["docset"]
-        self.section_path = facets["section_path"]
-        self.lastmod = lastmod
-        self.previous_lastmod = previous_lastmod
-        # Only known for a page seen before: the sitemap carries no titles, so a newly added URL
-        # has nothing to show but its path until it has been fetched once.
-        self.title = title
-
-    def as_dict(self):
-        return {"url": self.url, "kind": self.kind, "product": self.product,
-                "version": self.version, "docset": self.docset, "title": self.title,
-                "lastmod": self.lastmod.isoformat() if self.lastmod else None,
-                "previous_lastmod": (self.previous_lastmod.isoformat()
-                                     if self.previous_lastmod else None)}
+# How often progress is reported and work committed.
+BATCH = 50
 
 
-def check(conn, scope=None, pages=None):
-    """→ (changes, total_in_scope). Nothing is fetched beyond the sitemap itself.
+def _is_landing(url):
+    """True for the product landing pages, which are indexes rather than documentation.
 
-    `scope` filters by product ('ngfw'); None means the whole sitemap. `pages` lets a caller
-    that already holds a parsed sitemap reuse it instead of downloading it twice.
+    Judged by path depth because that is what separates them: /dns-security is a product's front
+    page, /dns-security/administration/… is a page of its manual. Everything Palo Alto publishes as
+    documentation sits at least two segments deep.
     """
-    pages = sitemap.fetch() if pages is None else pages
+    path = url[len(BASE):] if url.startswith(BASE) else url
+    return len([segment for segment in path.split("/") if segment]) <= 1
+
+
+def _document(url, result):
+    """→ (title, text) when this fetch produced a document, else None with the reason logged."""
+    if result.error or not result.text:
+        return None
+    title = (result.title or "").strip()
+    if not title:
+        return None
+    # A page whose body is only its own headings and the template's boilerplate is a section
+    # landing page. Structural rather than a length cutoff: the corpus holds a 5.1 MB CLI command
+    # hierarchy with no sentence in it, which any prose-shaped rule would have discarded.
+    if not residual(result.text):
+        return None
+    return title, result.text
+
+
+def survey(urls):
+    """HEAD every URL to find out what is really there. → (targets, stats)
+
+    The sitemap lists more than it has. A fifth of its URLs 301 onto a page it also lists, and a
+    few hundred are gone entirely, so a crawl told to fetch 21,916 pages ends with 17,300 documents
+    and a progress bar that never reaches its own end. This pass resolves that before any of it is
+    downloaded: redirects collapse onto their targets, missing pages drop out, and what remains is
+    the number worth showing an operator.
+
+    HEAD rather than GET because it answers the same question without the body — 20 pages/second
+    against 6.
+    """
+    stats = {"listed": len(urls), "ok": 0, "redirect": 0, "missing": 0, "unknown": 0}
+    targets = set()
+
+    def resolve(url):
+        status, location = probe(url)
+        return url, status, location
+
+    with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
+        for url, status, location in pool.map(resolve, urls):
+            if status in (301, 302, 307, 308) and location:
+                stats["redirect"] += 1
+                targets.add(sitemap.canonical(location))
+            elif status in (404, 410):
+                stats["missing"] += 1
+            elif status == 0:
+                # Unreachable during the survey says nothing about the page; let the crawl decide.
+                stats["unknown"] += 1
+                targets.add(url)
+            else:
+                stats["ok"] += 1
+                targets.add(url)
+
+    return sorted(targets), stats
+
+
+def crawl(conn, scope=None):
+    """Re-fetch the whole sitemap. Yields progress; the last message has final=True.
+
+    `scope` limits the run to one product (the first path segment), which is how a single product
+    is refreshed without re-reading the rest.
+    """
+    pages = sitemap.fetch(max_age=0)
     if scope:
         pages = {u: f for u, f in pages.items() if f["product"] == scope}
 
-    known = store.load_documents(conn)
-    changes = []
+    # Dropped before the fetch, not after: there is nothing to gain from downloading a landing
+    # page to then discard it.
+    listed = sorted(u for u in pages if not _is_landing(u))
 
-    for url, facets in pages.items():
-        previous = known.get(url)
-        if previous is None:
-            changes.append(Change(url, "added", facets, facets["lastmod"]))
-            continue
-        # A tombstoned URL that reappears in the sitemap is a restoration, not an edit.
-        if previous["deleted_at"] is not None:
-            changes.append(Change(url, "added", facets, facets["lastmod"],
-                                  previous["lastmod"]))
-            continue
-        # A page that did not come back usable last time is always a candidate, whatever its
-        # lastmod says. Nothing about a failed fetch changes the sitemap, so a lastmod-only rule
-        # would freeze the failure permanently — and the failures that matter most are transient.
-        # A full crawl recorded 155 throttled 403s that were all serving normally minutes later.
-        #
-        # An empty stored body counts as unusable even though the fetch reported success: pages
-        # crawled before the extractor learned to reject those are sitting on zero-character
-        # content rows with no error to find them by.
-        # Never verified for redirects. Such a row may be holding a body that belongs to a page it
-        # silently 301'd to, which reads as a clean fetch and no error-based rule can find.
-        if not previous.get("redirect_checked"):
-            changes.append(Change(url, "retry", facets, facets["lastmod"],
-                                  previous["lastmod"], unconditional=True,
-                                  title=previous.get("title")))
-            continue
+    # The run is claimed after the survey, not before it. start_run writes a row that only this
+    # generator will ever close, so claiming it before the first yield means a process killed in
+    # between leaves a row marked running for ever — and the guard that reads it then refuses
+    # every later crawl. The survey writes nothing, so there is nothing to record until it ends.
+    yield {"stage": "survey", "done": 0, "total": len(listed), "final": False}
+    urls, survey_stats = survey(listed)
+    run_id = store.start_run(conn)
+    log.info("survey: %s -> %d to fetch", survey_stats, len(urls))
 
-        if (previous.get("fetch_error")
-                or previous["content_sha"] is None
-                or not previous.get("char_count")):
-            changes.append(Change(url, "retry", facets, facets["lastmod"],
-                                  previous["lastmod"], unconditional=True,
-                                  title=previous.get("title")))
-            continue
+    counts = {"listed": survey_stats["listed"], "stored": 0, "rejected": 0}
+    kept = []
 
-        stored = previous["lastmod"]
-        if facets["lastmod"] and (stored is None or facets["lastmod"] > stored):
-            changes.append(Change(url, "changed", facets, facets["lastmod"], stored,
-                                  title=previous.get("title")))
-
-    # Gone from the sitemap: tombstone candidates. Restricted to the scope under examination so
-    # a per-product refresh cannot tombstone pages it never looked at.
-    for url, previous in known.items():
-        if url in pages or previous["deleted_at"] is not None:
-            continue
-        facets = sitemap.classify(url)
-        if scope and facets["product"] != scope:
-            continue
-        changes.append(Change(url, "removed", facets, None, previous["lastmod"],
-                              title=previous.get("title")))
-
-    log.info("check: %d pages in scope, %d changes (%s)", len(pages), len(changes),
-             ", ".join(f"{k}={sum(1 for c in changes if c.kind == k)}"
-                       for k in ("added", "changed", "retry", "removed")))
-    return changes, len(pages)
-
-
-def refresh(conn, changes, scope=None):
-    """Apply `changes`. Yields progress dicts; the final one carries done=True and the counts.
-
-    Committed in batches rather than in one transaction: a 21,768-page crawl held open as a
-    single transaction would keep an hours-long snapshot on a database that is also serving
-    retrieval, and would lose every page if it failed on the last one.
-    """
-    counts = {"checked": len(changes), "fetched": 0, "changed": 0, "added": 0,
-              "removed": 0, "skipped_304": 0, "skipped_same_sha": 0, "skipped_alias": 0,
-              "failed": 0}
-    run_id = store.start_run(conn, scope)
-    known = store.load_documents(conn)
-
-    removals = [c for c in changes if c.kind == "removed"]
-    work = [c for c in changes if c.kind != "removed"]
-
-    # Known aliases, from what previous crawls recorded. Their targets are fetched first so an
-    # alias can be answered out of the target's result rather than out of a second download.
-    alias_target = {
-        url: entry["canonical_url"]
-        for url, entry in known.items()
-        if entry.get("canonical_url") and entry["canonical_url"] != url
-    }
-    primary = [c for c in work if c.url not in alias_target]
-    aliases = [c for c in work if c.url in alias_target]
-
-    yield {"stage": "start", "done": 0, "total": len(work), "run_id": run_id, "done_flag": False}
+    yield {"stage": "start", "done": 0, "total": len(urls), "run_id": run_id,
+           "survey": survey_stats, "final": False}
 
     try:
         with conn.cursor() as cur:
-            if removals:
-                counts["removed"] = store.mark_deleted(cur, [c.url for c in removals])
-                conn.commit()
-                yield {"stage": "tombstone", "done": 0, "total": len(work),
-                       "removed": counts["removed"], "done_flag": False}
-
-            def job(change):
-                previous = known.get(change.url) or {}
-                since = None if change.unconditional else previous.get("last_modified")
-                return change, fetch(change.url, last_modified=since)
-
-            completed = 0
-            # Keyed by both the URL asked for and the URL the fetch ended on, so an alias finds
-            # its target's body whichever of the two it was recorded under.
-            fetched_sha = {}
-
+            done = 0
             with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
-                for change, result in pool.map(job, primary):
-                    completed += 1
-
-                    if result.not_modified:
-                        counts["skipped_304"] += 1
-                        store.touch_seen(cur, change.url, change.lastmod)
-                    elif result.error:
-                        counts["failed"] += 1
-                        store.put_document(cur, change.url,
-                                           {"product": change.product, "version": change.version,
-                                            "docset": change.docset,
-                                            "section_path": change.section_path},
-                                           change.lastmod, result, None)
+                for url, result in pool.map(lambda u: (u, fetch(u)), urls):
+                    done += 1
+                    doc = _document(url, result)
+                    if doc is None:
+                        counts["rejected"] += 1
                     else:
-                        counts["fetched"] += 1
-                        digest = store.sha256(result.text)
-                        unchanged = (known.get(change.url) or {}).get("content_sha") == digest
-                        if unchanged:
-                            counts["skipped_same_sha"] += 1
-                        else:
-                            store.put_content(cur, result.text)
-                            counts["added" if change.kind == "added" else "changed"] += 1
-                        fetched_sha[change.url] = digest
-                        fetched_sha[result.final_url] = digest
-                        store.put_document(cur, change.url,
-                                           {"product": change.product, "version": change.version,
-                                            "docset": change.docset,
-                                            "section_path": change.section_path},
-                                           change.lastmod, result, digest)
+                        title, text = doc
+                        # Stored under the URL the fetch ended on: a redirected page belongs to its
+                        # target, and several aliases landing there collapse onto one row.
+                        final_url = result.final_url or url
+                        # Both lookups are misses waiting to happen. The survey replaces a
+                        # redirecting URL with its target, and a target need not itself be listed
+                        # in the sitemap — `pages[url]` on such a URL raised KeyError and took the
+                        # whole crawl down 1,273 pages in. A page with no sitemap entry simply has
+                        # no vendor timestamp, which is a missing field and not a failure.
+                        lastmod = (pages.get(final_url, {}).get("lastmod")
+                                   or pages.get(url, {}).get("lastmod"))
+                        store.put(cur, final_url, title, text, lastmod)
+                        kept.append(final_url)
+                        counts["stored"] += 1
 
-                    if completed % 50 == 0:
+                    if done % BATCH == 0:
                         conn.commit()
-                        yield {"stage": "fetch", "done": completed, "total": len(work),
-                               "counts": dict(counts), "done_flag": False}
+                        yield {"stage": "fetch", "done": done, "total": len(urls),
+                               "counts": dict(counts), "survey": survey_stats, "final": False}
 
-                # Aliases second, now that every target this run touched has a body.
-                for change in aliases:
-                    completed += 1
-                    facets = {"product": change.product, "version": change.version,
-                              "docset": change.docset, "section_path": change.section_path}
-                    digest = fetched_sha.get(alias_target[change.url])
-
-                    if digest is not None:
-                        counts["skipped_alias"] += 1
-                        # A synthetic result: the fetch that produced this body already happened,
-                        # under the target's URL. Recorded as the redirect it is, not as a 200 this
-                        # alias served.
-                        alias_result = Result(change.url, status=301,
-                                              final_url=alias_target[change.url])
-                        store.put_document(cur, change.url, facets, change.lastmod,
-                                           alias_result, digest)
-                        continue
-
-                    # The target was not part of this run — fetch normally and let the redirect be
-                    # followed, which is also how the alias got recorded in the first place.
-                    since = (None if change.unconditional
-                             else (known.get(change.url) or {}).get("last_modified"))
-                    result = fetch(change.url, last_modified=since)
-                    if result.not_modified:
-                        counts["skipped_304"] += 1
-                        store.touch_seen(cur, change.url, change.lastmod)
-                    elif result.error:
-                        counts["failed"] += 1
-                        store.put_document(cur, change.url, facets, change.lastmod, result, None)
-                    else:
-                        counts["fetched"] += 1
-                        digest = store.sha256(result.text)
-                        if (known.get(change.url) or {}).get("content_sha") == digest:
-                            counts["skipped_same_sha"] += 1
-                        else:
-                            store.put_content(cur, result.text)
-                            counts["added" if change.kind == "added" else "changed"] += 1
-                        store.put_document(cur, change.url, facets, change.lastmod, result, digest)
-
-                    if completed % 50 == 0:
-                        conn.commit()
-                        yield {"stage": "fetch", "done": completed, "total": len(work),
-                               "counts": dict(counts), "done_flag": False}
-
-                # Bodies the run has just orphaned — a page that changed leaves its previous
-                # text behind with nothing pointing at it.
-                pruned = store.prune_orphan_content(cur)
-                if pruned:
-                    log.info("pruned %d orphaned content rows", pruned)
-
+            # A full crawl is the whole truth about what exists; anything not seen is gone. Only
+            # when the run covered everything — a scoped run knows nothing about other products.
+            if not scope and kept:
+                removed = store.drop_missing(cur, kept)
+                if removed:
+                    log.info("dropped %d documents no longer listed", removed)
             conn.commit()
+    except GeneratorExit:
+        # The caller stopped consuming — the console cancelled, or its stream died. Not a failure:
+        # everything committed so far stays, and the run has to be closed out here because nothing
+        # else will. GeneratorExit descends from BaseException, not Exception, so the handler below
+        # never sees it; without this branch the run stayed 'running' for ever and every later
+        # update was refused as "a crawl is already running".
+        conn.commit()
+        store.finish_run(conn, run_id, "cancelled", counts)
+        log.info("crawl cancelled after %d/%d", counts["stored"], len(urls))
+        raise
     except Exception as exc:                     # noqa: BLE001 - reported, not swallowed
         conn.rollback()
         store.finish_run(conn, run_id, "failed", counts, str(exc))
-        log.exception("refresh failed after %d/%d", counts["fetched"], len(work))
-        yield {"stage": "failed", "error": str(exc), "counts": counts, "done_flag": True}
+        log.exception("crawl failed after %d/%d", counts["stored"], len(urls))
+        yield {"stage": "failed", "error": str(exc), "counts": counts, "final": True}
         return
 
     store.finish_run(conn, run_id, "ok", counts)
-    log.info("refresh complete: %s", counts)
-    yield {"stage": "done", "done": len(work), "total": len(work),
-           "counts": counts, "run_id": run_id, "done_flag": True}
+    log.info("crawl complete: %s", counts)
+    yield {"stage": "done", "done": len(urls), "total": len(urls),
+           "counts": counts, "survey": survey_stats, "run_id": run_id, "final": True}

@@ -21,22 +21,43 @@ service PretzelAi {
   // sitemap fetch) and tells the operator what a refresh would do, so Refresh is never a blind
   // 21,768-page download.
 
-  // What has moved since the last crawl. Seconds, no page bodies fetched.
-  rpc CheckCorpus(CheckCorpusRequest) returns (CorpusCheck);
-
-  // Apply those changes. Streams progress because it runs for minutes and the console holds a
-  // window open for it; the stream is also the cancellation channel — mgmtd stops reading and
-  // the crawl stops.
+  // Re-fetch every page the sitemap lists and keep the ones that are documents. Streams progress
+  // because it runs for the better part of an hour and the console holds a window open for it;
+  // the stream is also the cancellation channel — mgmtd stops reading and the crawl stops.
   rpc RefreshCorpus(RefreshCorpusRequest) returns (stream RefreshProgress);
 
-  // What is in the store right now, for the card's resting state.
+  // What is in the store right now: the card's resting state and the corpus browser's tree.
   rpc GetCorpusStatus(CorpusStatusRequest) returns (CorpusStatus);
+
+  // The documents under one product/book, for the corpus browser. Titles and URLs only — the
+  // bodies are what the assistant reads, not what an operator scrolls.
+  rpc ListDocuments(ListDocumentsRequest) returns (DocumentList);
+}
+
+// One earlier turn of the conversation, replayed so the model — and the guardrail — can see what
+// came before. Only user and assistant turns travel here; the system prompt is not one of them and
+// stays in its own field, because it is the appliance's policy rather than part of the exchange.
+message ChatTurn {
+  string role = 1;     // "user" | "assistant"; anything else is dropped
+  string content = 2;
 }
 
 message ChatRequest {
   string model = 1;          // "" -> the server's default model
   string message = 2;        // the person's turn
   string system_prompt = 3;  // optional override; "" -> server default
+
+  // The turns before this one, oldest first, NOT including `message`. A chat turn is stateless on
+  // the wire: the server keeps no conversation, so whatever context a turn should have is the
+  // caller's to send. That is deliberate — mgmtd already owns the conversation the operator sees,
+  // and a second copy on this side would be a second source of truth to keep in step.
+  repeated ChatTurn history = 4;
+
+  // Which conversation this turn belongs to. Forwarded to the gateway as x-portkey-trace-id, which
+  // Portkey passes through to Prisma AIRS as its tr_id — the field AIRS groups scans by. Without
+  // it AIRS mints a fresh id per call, so every turn lands in its own session and the Sessions view
+  // can never show a conversation. "" -> let AIRS generate one.
+  string session_id = 5;
 }
 
 message ChatChunk {
@@ -52,106 +73,70 @@ message ChatChunk {
 
 // --- Tech-doc corpus ---------------------------------------------------------------------
 
-message CheckCorpusRequest {
+message RefreshCorpusRequest {
   string scope = 1;   // one product ("ngfw"); "" -> the whole sitemap
 }
 
-// One pending unit of work, as the console lists it for the operator to look at before
-// confirming. `kind` is added | changed | removed.
-message DocChange {
-  string url = 1;
-  string kind = 2;   // added | changed | retry | removed
-  string product = 3;
-  string version = 4;   // "" when the URL carries no version segment
-  string docset = 5;
-  string lastmod = 6;            // ISO-8601, from the sitemap
-  string previous_lastmod = 7;   // what the store had; "" for a page never seen before
-  string title = 8;              // "" for a page never fetched, which is every newly added one
-}
-
-// Changes folded onto the product/docset tree the URLs imply.
-//
-// The sitemap itself is 22,519 flat <loc> entries carrying a timestamp and nothing else — no
-// titles, no hierarchy, no grouping. Handing that back to an operator as a list of URLs asks them
-// to read structure out of path strings. The grouping is derived here so the console can say
-// "PAN-OS / Administration: 12 changed" and leave the URLs underneath it.
-message ChangeGroup {
-  string product = 1;
-  string docset  = 2;
-  string version = 3;
-  int32 added    = 4;
-  int32 changed  = 5;
-  int32 removed  = 6;
-  int32 retry    = 7;
-}
-
-message CorpusCheck {
-  int32 total_in_scope = 1;
-  int32 added   = 2;
-  int32 changed = 3;
-  int32 removed = 4;
-  // Pages the last crawl could not read, not pages that changed. Counted apart because they are a
-  // different fact about the appliance: "we owe these a retry", not "the documentation moved".
-  int32 retry   = 9;
-  // Capped: the operator needs to see what kind of change this is, not read 21,768 URLs. The
-  // counts above are the complete answer; this is the sample under them.
-  repeated DocChange changes = 5;
-  bool truncated = 6;
-  string error = 7;
-  repeated ChangeGroup groups = 8;   // complete; `changes` is only a sample
-}
-
-message RefreshCorpusRequest {
-  string scope = 1;
-}
-
-// Emitted every batch. skipped_304 and skipped_same_sha are reported apart from `fetched` on
-// purpose: together they are the evidence that a refresh reporting "12 changed" still looked at
-// everything in scope.
+// Emitted every batch. `rejected` counts pages that were fetched and turned out not to be
+// documents — 404s, redirects onto a page already stored, bodies that render to nothing. They are
+// not shown to the operator individually: there is nothing to do about a page Palo Alto removed.
 message RefreshProgress {
-  string stage = 1;   // start | tombstone | fetch | done | failed
-  int32 done  = 2;
-  int32 total = 3;
+  string stage = 1;   // survey | start | fetch | done | failed | cancelled
+  int32  done  = 2;
+  int32  total = 3;   // during survey: URLs listed. after it: pages actually to fetch.
 
-  int32 fetched          = 4;
-  int32 added            = 5;
-  int32 changed          = 6;
-  int32 removed          = 7;
-  int32 skipped_304      = 8;
-  int32 skipped_same_sha = 9;
-  int32 failed           = 10;
-  int32 skipped_alias    = 14;   // resolved from a redirect target already fetched this run
+  int32  listed   = 4;
+  int32  stored   = 5;
+  int32  rejected = 6;
 
-  bool   final = 11;   // true exactly once, on the last message
-  string error = 12;   // set only when the run failed; final is also true in that case
-  int64  run_id = 13;
+  // What the HEAD survey found, so the console can show a target the crawl can actually reach.
+  // The sitemap lists ~21,900 URLs; a fifth redirect onto a page it also lists and a few hundred
+  // are gone, which is why a bar drawn against the listed count never fills.
+  int32 survey_ok       = 10;
+  int32 survey_redirect = 11;
+  int32 survey_missing  = 12;
+
+  bool   final  = 7;  // true exactly once, on the last message
+  string error  = 8;
+  int64  run_id = 9;
 }
 
 message CorpusStatusRequest {}
 
-// One row of the product/docset tree the corpus actually contains.
-//
-// The sitemap has no hierarchy — 22,519 flat URLs — so this is derived from the URL paths, and it
-// is the only structured view of the corpus that exists anywhere. 64 products, 321 docsets: small
-// enough to send whole, which is what lets the console render a browsable tree instead of a count.
+// One row of the product/book tree, derived from the URL paths — docs.paloaltonetworks.com
+// publishes one flat sitemap with no hierarchy of its own.
 message ProductStat {
   string product   = 1;
   string docset    = 2;
   int32  documents = 3;
   int32  bodies    = 4;
   int64  chars     = 5;
-  int32  versions  = 6;
-  int32  failed    = 7;
 }
 
 message CorpusStatus {
-  int32  documents  = 1;   // live, excluding tombstones
-  int32  tombstoned = 2;
-  int32  bodies     = 3;   // distinct content rows; documents/bodies is the dedup ratio
-  int64  chars      = 4;
-  string last_run_at     = 5;
-  string last_run_status = 6;
-  int64  last_run_id     = 7;
-  string error = 8;
-  repeated ProductStat products = 9;
+  int32  documents = 1;
+  int32  bodies    = 2;   // distinct bodies; documents/bodies is how much text is shared
+  int64  chars     = 3;
+  string last_run_at     = 4;
+  string last_run_status = 5;
+  int64  last_run_id     = 6;
+  string error = 7;
+  repeated ProductStat products = 8;
+}
+
+message ListDocumentsRequest {
+  string product = 1;
+  string docset  = 2;   // "" means the product's top level
+}
+
+message DocumentSummary {
+  string url        = 1;
+  string title      = 2;
+  int32  char_count = 3;
+  string lastmod    = 4;   // vendor's last edit, ISO-8601
+}
+
+message DocumentList {
+  repeated DocumentSummary documents = 1;
+  string error = 2;
 }

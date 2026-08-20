@@ -42,11 +42,6 @@ def _chunks(text):
         yield token
 
 
-# The console lists a sample of the pending changes, not all of them. A refresh can legitimately
-# have five figures of work in it on a first build, and neither the wire nor the operator is
-# served by carrying every URL — the counts alongside are the complete answer.
-CHANGE_SAMPLE = 200
-
 # One refresh at a time. The crawl saturates the network worker pool and writes the whole techdoc
 # schema; two of them interleaved would double-fetch every page and race each other's writes for
 # no gain. A second caller is refused rather than queued, because the console's card is a
@@ -60,15 +55,19 @@ class PretzelAiServicer(pretzel_ai_pb2_grpc.PretzelAiServicer):
 
     def Chat(self, request, context):
         log.info(
-            "Chat turn from %s: model=%s system_prompt=%s message_chars=%d",
+            "Chat turn from %s: model=%s system_prompt=%s message_chars=%d history=%d session=%s",
             context.peer(),
             request.model or "(default)",
             "set" if request.system_prompt else "none",
             len(request.message),
+            len(request.history),
+            request.session_id or "(none)",
         )
 
+        history = [{"role": t.role, "content": t.content} for t in request.history]
         result = self._gateway.complete_turn(
-            request.model, request.message, request.system_prompt or None)
+            request.model, request.message, request.system_prompt or None,
+            history, request.session_id)
 
         # Stream the reply text (only present on a successful turn) so the console fills in as it
         # arrives; a failed turn streams nothing and carries its reason on the final chunk.
@@ -84,55 +83,6 @@ class PretzelAiServicer(pretzel_ai_pb2_grpc.PretzelAiServicer):
 
     # --- The tech-doc knowledge base ------------------------------------------------------
 
-    def CheckCorpus(self, request, context):
-        scope = request.scope or None
-        log.info("CheckCorpus from %s: scope=%s", context.peer(), scope or "(all)")
-        try:
-            with corpus_store.connect() as conn:
-                changes, total = corpus_pipeline.check(conn, scope=scope)
-        except Exception as exc:                    # noqa: BLE001 - reported to the console
-            log.exception("CheckCorpus failed")
-            return pretzel_ai_pb2.CorpusCheck(error=str(exc))
-
-        counts = {"added": 0, "changed": 0, "removed": 0, "retry": 0}
-        # Folded onto (product, version, docset) — the tree the URLs imply and the sitemap does
-        # not. Complete, unlike the change sample below it: the operator judges the shape of a
-        # refresh from this, not from the first 200 URLs.
-        groups = {}
-        for change in changes:
-            counts[change.kind] += 1
-            key = (change.product or "", change.version or "", change.docset or "")
-            bucket = groups.setdefault(
-                key, {"added": 0, "changed": 0, "removed": 0, "retry": 0})
-            bucket[change.kind] += 1
-
-        return pretzel_ai_pb2.CorpusCheck(
-            total_in_scope=total,
-            added=counts["added"], changed=counts["changed"], removed=counts["removed"],
-            retry=counts["retry"],
-            truncated=len(changes) > CHANGE_SAMPLE,
-            groups=[
-                pretzel_ai_pb2.ChangeGroup(
-                    product=product, version=version, docset=docset,
-                    added=b["added"], changed=b["changed"], removed=b["removed"],
-                    retry=b["retry"])
-                for (product, version, docset), b in sorted(
-                    groups.items(),
-                    key=lambda kv: -sum(kv[1].values()))
-            ],
-            changes=[
-                pretzel_ai_pb2.DocChange(
-                    url=c.url, kind=c.kind, product=c.product or "",
-                    version=c.version or "", docset=c.docset or "",
-                    lastmod=c.lastmod.isoformat() if c.lastmod else "",
-                    previous_lastmod=(c.previous_lastmod.isoformat()
-                                      if c.previous_lastmod else ""),
-                    title=c.title or "",
-                )
-                for c in changes[:CHANGE_SAMPLE]
-            ],
-        )
-
     def RefreshCorpus(self, request, context):
         scope = request.scope or None
         log.info("RefreshCorpus from %s: scope=%s", context.peer(), scope or "(all)")
@@ -145,9 +95,8 @@ class PretzelAiServicer(pretzel_ai_pb2_grpc.PretzelAiServicer):
 
         try:
             with corpus_store.connect() as conn:
-                # Also checked in the database, not just in this process: the CLI used for the
-                # first full build is a separate process writing the same schema, and a console
-                # refresh started on top of it would fetch every page twice.
+                # Also checked in the database: the CLI is a separate process writing the same
+                # schema, and a console refresh started on top of it would fetch everything twice.
                 in_flight = corpus_store.running_run(conn)
                 if in_flight:
                     yield pretzel_ai_pb2.RefreshProgress(
@@ -156,16 +105,10 @@ class PretzelAiServicer(pretzel_ai_pb2_grpc.PretzelAiServicer):
                                f"(started {in_flight[1]:%Y-%m-%d %H:%M})"))
                     return
 
-                changes, _total = corpus_pipeline.check(conn, scope=scope)
-                if not changes:
-                    yield pretzel_ai_pb2.RefreshProgress(stage="done", final=True)
-                    return
-
-                for update in corpus_pipeline.refresh(conn, changes, scope=scope):
-                    # The console closing its window cancels the crawl. That is the documented
-                    # behaviour of this card, not a failure: the operator was told to keep the
-                    # window open, and a half-applied refresh is resumable — every page already
-                    # written keeps its content hash, so the next run skips it.
+                for update in corpus_pipeline.crawl(conn, scope=scope):
+                    # The console closing its window cancels the crawl. Documented behaviour of
+                    # this card, not a failure: the operator was told to keep the window open, and
+                    # whatever was written stays written.
                     if not context.is_active():
                         log.info("RefreshCorpus cancelled by client")
                         return
@@ -188,23 +131,37 @@ class PretzelAiServicer(pretzel_ai_pb2_grpc.PretzelAiServicer):
             **snapshot,
             products=[pretzel_ai_pb2.ProductStat(**row) for row in tree])
 
+    def ListDocuments(self, request, context):
+        try:
+            rows = _list_documents(self, request, context)
+        except Exception as exc:                    # noqa: BLE001 - reported to the console
+            log.exception("ListDocuments failed")
+            return pretzel_ai_pb2.DocumentList(error=str(exc))
+        return pretzel_ai_pb2.DocumentList(
+            documents=[pretzel_ai_pb2.DocumentSummary(**row) for row in rows])
+
+
+def _list_documents(servicer, request, context):
+    """Shared by the RPC below; kept apart so the error shape is written once."""
+    with corpus_store.connect() as conn:
+        return corpus_store.documents(conn, request.product, request.docset)
+
 
 def _progress_message(update):
-    """pipeline.refresh's dict -> the wire message. Counts are absent on the earliest stages."""
+    """pipeline.crawl's dict -> the wire message. Counts are absent on the earliest stages."""
     counts = update.get("counts") or {}
+    survey = update.get("survey") or {}
     return pretzel_ai_pb2.RefreshProgress(
         stage=update.get("stage", ""),
         done=update.get("done", 0),
         total=update.get("total", 0),
-        fetched=counts.get("fetched", 0),
-        added=counts.get("added", 0),
-        changed=counts.get("changed", 0),
-        removed=counts.get("removed", update.get("removed", 0)),
-        skipped_304=counts.get("skipped_304", 0),
-        skipped_same_sha=counts.get("skipped_same_sha", 0),
-        skipped_alias=counts.get("skipped_alias", 0),
-        failed=counts.get("failed", 0),
-        final=bool(update.get("done_flag")),
+        listed=counts.get("listed", 0),
+        stored=counts.get("stored", 0),
+        rejected=counts.get("rejected", 0),
+        survey_ok=survey.get("ok", 0),
+        survey_redirect=survey.get("redirect", 0),
+        survey_missing=survey.get("missing", 0),
+        final=bool(update.get("final")),
         error=update.get("error", "") or "",
         run_id=update.get("run_id", 0) or 0,
     )

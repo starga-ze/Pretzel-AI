@@ -1,15 +1,9 @@
 """Fetching a page, and knowing when not to.
 
-Every request is conditional on Last-Modified: the value recorded by the previous crawl goes back
-out as If-Modified-Since, so an unchanged page costs a 304 and no body. That is the second
-staleness gate — the sitemap's lastmod says a page *might* have moved, and this says whether the
-server agrees.
-
-Deliberately not ETag. docs.paloaltonetworks.com serves a different ETag for the same unchanged
-page on consecutive requests ("79701-6595c05d4a65a-gzip" then "796fb-6595c068dcd05-gzip" seconds
-apart), so If-None-Match never matches and every request would come back 200 with a full body.
-The header is still recorded on the document row for diagnostics, but sending it back would cost
-the entire saving this gate exists for.
+Unconditional. There is no incremental crawl to support, so nothing is remembered between runs and
+there is nothing to make a request conditional on. (Both cache validators this site offers were
+tried: ETag changes on every request for the same unchanged page, so If-None-Match never matches;
+If-Modified-Since does work, and paid for itself only while the crawl was incremental.)
 
 The retry policy exists for one specific failure. A page can answer 200 with the site chrome
 intact and the content root missing; the same URL fetched again returns the real body. Because it
@@ -50,45 +44,35 @@ THROTTLE_BACKOFF_BASE = 4.0
 
 
 class Result:
-    """One fetch outcome. `status` is the HTTP code; 0 means the request never completed.
+    """One fetch outcome. `status` is the HTTP code; 0 means the request never completed."""
 
-    not_modified and text are mutually exclusive: a 304 carries no body, which is the point.
-    """
+    __slots__ = ("url", "final_url", "status", "text", "title", "root", "error")
 
-    __slots__ = ("url", "final_url", "status", "not_modified", "text", "title", "root",
-                 "etag", "last_modified", "error")
-
-    def __init__(self, url, status=0, not_modified=False, text=None, title=None,
-                 root=None, etag=None, last_modified=None, error=None, final_url=None):
+    def __init__(self, url, status=0, text=None, title=None, root=None, error=None,
+                 final_url=None):
         self.url = url
         # Where the request actually ended. Whole subtrees of this site 301 onto one page, and
         # urllib follows without saying so; without this the store records a body under a URL that
         # never served it.
         self.final_url = final_url or url
         self.status = status
-        self.not_modified = not_modified
         self.text = text
         self.title = title
         self.root = root
-        self.etag = etag
-        self.last_modified = last_modified
         self.error = error
 
     @property
     def ok(self):
-        return self.error is None and (self.not_modified or self.text is not None)
+        return self.error is None and self.text is not None
 
     def __repr__(self):
-        state = ("304" if self.not_modified
-                 else f"{self.status} {len(self.text)}c" if self.text is not None
+        state = (f"{self.status} {len(self.text)}c" if self.text is not None
                  else f"ERR {self.error}")
         return f"<Result {self.url} {state}>"
 
 
-def _request(url, last_modified, timeout):
+def _request(url, timeout):
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-    if last_modified:
-        headers["If-Modified-Since"] = last_modified
 
     request = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -96,7 +80,39 @@ def _request(url, last_modified, timeout):
         return response.status, body, response.headers, response.geturl()
 
 
-def fetch(url, last_modified=None, timeout=30):
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """An opener that reports a redirect instead of following it."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_probe_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def probe(url, timeout=15):
+    """→ (status, location). A HEAD that does not follow redirects.
+
+    Used before a crawl to find out what the sitemap's URLs really are: how many are pages, how
+    many redirect onto a page already listed, how many are gone. That count is what the console
+    shows as the target — a progress bar out of 21,916 when 4,300 of those collapse and 260 do not
+    exist is a bar that never reaches its own end.
+
+    HEAD rather than GET because it answers the same question without the body: 20 pages/second
+    against 6, and this pass exists to save time rather than spend it.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
+    try:
+        with _probe_opener.open(request, timeout=timeout) as response:
+            return response.status, None
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location")
+    except (urllib.error.URLError, OSError, TimeoutError):
+        # Unreachable now says nothing about whether the page exists; the crawl will find out.
+        return 0, None
+
+
+def fetch(url, timeout=30):
     """→ Result. Retries transient failures and shell responses; never raises for a bad page."""
     last_error = None
     status = 0
@@ -104,10 +120,8 @@ def fetch(url, last_modified=None, timeout=30):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         throttled = False
         try:
-            status, body, headers, final_url = _request(url, last_modified, timeout)
+            status, body, headers, final_url = _request(url, timeout)
         except urllib.error.HTTPError as e:
-            if e.code == 304:
-                return Result(url, status=304, not_modified=True)
             # 404/410 are settled answers: the page is gone and retrying cannot change that.
             if e.code in (404, 410):
                 return Result(url, status=e.code, error=f"HTTP {e.code}")
@@ -127,10 +141,8 @@ def fetch(url, last_modified=None, timeout=30):
                 log.debug("no usable body on attempt %d: %s (%s)", attempt, url, e)
             else:
                 return Result(url, status=status, text=text, title=title_of(body), root=root,
-                              etag=headers.get("ETag"),
-                              last_modified=headers.get("Last-Modified"),
-                              # Normalised so it can be compared against a stored URL; the raw
-                              # value can carry an empty path segment the redirect introduced.
+                              # Normalised: a redirect Location on this site can carry an empty
+                              # path segment (ngfw/networking//session-settings).
                               final_url=canonical(final_url))
 
         if attempt < MAX_ATTEMPTS:

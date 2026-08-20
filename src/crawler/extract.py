@@ -53,6 +53,12 @@ _TAG = re.compile(r"(?s)<[^>]+>")
 _SENTENCE_END = re.compile(r"[.:;!?)\]]$")
 _TITLE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 
+# Labels the template prints on every page. Not content, and their presence must not make a page
+# that carries nothing else look like it carries something.
+_LABELS = re.compile(
+    r"^(Where Can I Use This\?|What Do I Need\?|Updated on .{5,60}|Release Date:.*|"
+    r"Last Updated:.*|Learn More|View Now|Version|Focus|Home|Clear)$", re.I)
+
 
 class NoContentRoot(Exception):
     """The page did not yield a usable body — a shell response, not an empty document.
@@ -104,7 +110,14 @@ def _find_root(markup):
 
 
 def _merge_hard_wraps(lines):
-    """Rejoin DITA's mid-sentence line breaks; keep headings and list items standing alone."""
+    """Rejoin DITA's mid-sentence line breaks; keep headings and list items standing alone.
+
+    A heading never absorbs what follows it, which the guard below has to say twice: once for the
+    incoming line and once for the buffer. Guarding only the incoming line let "## Description"
+    swallow the paragraph after it, because a heading does not end in sentence punctuation either.
+    That merged 837 documents' first paragraph into their heading — invisible in the text, but the
+    heading boundaries are exactly what the chunker splits on, so it moved every chunk edge in
+    those documents."""
     merged, buffer = [], ""
     for line in lines:
         if not line:
@@ -112,7 +125,8 @@ def _merge_hard_wraps(lines):
                 merged.append(buffer)
                 buffer = ""
             continue
-        if buffer and not _SENTENCE_END.search(buffer) and not line.startswith("#"):
+        if (buffer and not buffer.startswith("#")
+                and not _SENTENCE_END.search(buffer) and not line.startswith("#")):
             buffer += " " + line
         else:
             if buffer:
@@ -164,3 +178,46 @@ def extract(markup):
         # "# Administration" and 80 characters; only *nothing* is evidence the page was not served.
         raise NoContentRoot(f"content root {root!r} extracted to nothing")
     return root, body
+
+
+def residual(text):
+    """The part of a body that is neither its masthead nor a restatement of its own headings.
+
+    Every page opens with the same block: an "Updated on …" line, the product name, the docset
+    name, and the title — then the first heading, then whatever the page actually says. So
+    everything above the first heading is masthead by construction, and a page with nothing below
+    it is a section landing page: it names itself and stops.
+
+    What survives that is then stripped of headings, of the template's standing labels, and of
+    repeated lines, because a breadcrumb trail says the same words more than once.
+
+    Keyed on structure rather than on the document title so this stays a pure function of the body:
+    one body is shared by many URLs whose titles need not agree, and a rule that consulted the
+    title would give the same text two different answers depending on which URL asked.
+
+    Deliberately not a length threshold. The corpus holds a 5.1 MB PAN-OS CLI command hierarchy
+    whose lines are bare commands — no sentences, no punctuation, and exactly the reference
+    material a support assistant is asked about. A rule phrased in terms of prose discards it.
+    Phrased in terms of what sits below the masthead, it keeps all of it.
+    """
+    lines = [raw.strip() for raw in (text or "").split("\n")]
+    lines = [line for line in lines if line]
+
+    first_heading = next((i for i, line in enumerate(lines) if line.startswith("#")), None)
+    if first_heading is None:
+        # No heading at all: nothing marks where the masthead ends, so judge the whole body.
+        body = lines
+        headings = set()
+    else:
+        body = lines[first_heading + 1:]
+        headings = {line.lstrip("#").strip().lower()
+                    for line in lines if line.startswith("#")}
+
+    seen, kept = set(), []
+    for line in body:
+        low = line.lower()
+        if line.startswith("#") or _LABELS.match(line) or low in headings or low in seen:
+            continue
+        seen.add(low)
+        kept.append(line)
+    return "\n".join(kept)

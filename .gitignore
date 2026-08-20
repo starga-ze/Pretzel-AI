@@ -1,15 +1,14 @@
-# virtualenv created by `./pretzel-ai install`
-.venv/
-
-# python bytecode
-__pycache__/
-*.py[cod]
-
-# gRPC stubs generated from src/grpc/pretzel_ai.proto by `./pretzel-ai build`
-src/grpc/pretzel_ai_pb2.py
-src/grpc/pretzel_ai_pb2_grpc.py
-
-# The live gateway config: it holds the API key, so it stays out of the repo.
-# Copy config.example.json to config.json and fill it in, or leave the key empty
-# there and supply PZ_PORTKEY_API_KEY in the environment.
+# 실제 자격증명 — 절대 커밋 금지
 prisma-airs/config.json
+prisma-airs/*.bak
+*.key
+
+# 벤치마크 실행 산출물 (게이트웨이 응답, 재생성 가능)
+dataset/run_*.jsonl
+dataset/run_*.py
+dataset/__pycache__/
+__pycache__/
+*.pyc
+
+# 편집기 스왑
+*.swp
