@@ -244,12 +244,15 @@ class GatewayService:
         started = time.monotonic()
         out = {"model": model}
 
-        # Which endpoint this turn goes to. Resolved BEFORE the credential is looked up, because the
-        # credential id depends on the route (the gateway's own key vs a provider's direct key) —
-        # the inferd port had these two swapped, which read `route` before it was assigned.
+        # [LOG] 요청 시작 로그 (모델, 메시지 수, 세션 ID 기록)
+        log.info("Starting complete request: model=%s, messages_count=%d, session_id=%s",
+                 model, len(messages), session_id or "(none)")
+
+        # Which endpoint this turn goes to.
         route, route_err = self._resolve_route(model)
         if route_err:
             out.update({"ok": False, "code": "BAD_ROUTE", "error": route_err, "latency_ms": 0})
+            log.error("Route resolution failed for model '%s': %s", model, route_err)
             return out
 
         key = self._credentials.key(route["credential_id"])
@@ -258,41 +261,29 @@ class GatewayService:
                         "error": (f"no credential for '{route['credential_id']}' is configured on "
                                   f"this appliance"),
                         "latency_ms": 0})
+            log.error("Missing credentials for credential_id '%s'", route['credential_id'])
             return out
 
         scheme = "https" if route.get("tls", True) else "http"
         url = f"{scheme}://{route['host']}:{route.get('port', 443)}{route['path']}"
         body = json.dumps({
             "model": model,
-            "max_tokens": self._gw.get("max_tokens", 512),
+            "max_tokens": self._gw.get("max_tokens", 4096),
             "messages": messages,
-            # Said out loud rather than left to the gateway's default: a gateway that streamed by
-            # default would return a body this cannot parse. (pretzel-ai re-streams the completed
-            # reply to the console itself — see server._stream_turn.)
             "stream": False,
         }).encode()
 
-        # urllib's default User-Agent is "Python-urllib/<ver>", which the gateway's CDN blocks
-        # outright (Cloudflare 1010). Naming the daemon is both the fix and the courtesy.
         headers = {"Content-Type": "application/json",
                    "User-Agent": USER_AGENT,
                    route["api_key_header"]: route.get("api_key_prefix", "") + key}
 
-        # Which saved integration to route through is carried in the model field itself, as
-        # @<integration-slug>/<model> (e.g. @openai/gpt-4o-2024-11-20) — Portkey's own SDK syntax.
-        # So no x-portkey-provider header is sent; the model string is the whole routing decision.
-
-        # Operator-declared extras last, so config can override anything above.
         headers.update(self._gw.get("headers") or {})
 
-        # The conversation id, and the only way to set one. Portkey forwards this header to Prisma
-        # AIRS as the scan's tr_id, which is what AIRS groups its Sessions view by; the guardrail's
-        # own settings expose no per-request field for it. Undocumented on both sides and verified
-        # against the live gateway: the tr_id that comes back equals whatever is sent here, and the
-        # prompt-side and response-side scans of a turn share it. Sent last so it cannot be
-        # clobbered by a stale operator-declared header of the same name.
         if session_id:
             headers["x-portkey-trace-id"] = session_id
+
+        # [LOG] 실제 HTTP 요청 전송 로그 (상세 URL 및 bypass 여부)
+        log.debug("Sending HTTP POST to %s (bypass=%s)", url, route.get("bypass", False))
 
         status, raw, transport_error = 0, "", ""
         try:
@@ -300,9 +291,9 @@ class GatewayService:
             with urllib.request.urlopen(req, timeout=self._gw.get("timeout_sec", 45)) as r:
                 status, raw = r.status, r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
-            # A non-2xx still carries a body, and for a guardrail denial (446) that body is the
-            # whole point — it must be parsed, not discarded as a failure.
             status, raw = e.code, e.read().decode("utf-8", "replace")
+            # [LOG] HTTP 에러 응답 수신 기록 (446 가드레일 등의 가능성)
+            log.info("HTTP Error received from gateway: status=%d", status)
         except (urllib.error.URLError, OSError) as e:
             transport_error = str(getattr(e, "reason", e))
 
@@ -311,7 +302,7 @@ class GatewayService:
         if transport_error:
             out.update({"ok": False, "code": "UNREACHABLE",
                         "error": transport_error or "could not reach the gateway"})
-            log.warning("chat turn failed to leave: %s", transport_error)
+            log.warning("chat turn failed to leave (latency=%dms): %s", out["latency_ms"], transport_error)
             return out
 
         try:
@@ -321,7 +312,8 @@ class GatewayService:
             out.update({"ok": False, "code": "BAD_RESPONSE", "status": status,
                         "error": f"gateway response was not JSON ({e}): {detail}"
                                  if detail else f"gateway response was not JSON: {e}"})
-            log.warning("chat turn unreadable (status=%s, body=%s)", status, detail[:120])
+            log.warning("chat turn unreadable (status=%s, latency=%dms, body=%s)",
+                        status, out["latency_ms"], detail[:120])
             return out
 
         out["scan"] = extract_scan(doc)
@@ -337,30 +329,25 @@ class GatewayService:
             err_msg = doc.get("message", "") or "the gateway rejected the request"
             err_type = err_type or "gateway_rejected"
 
-        # A denial does not always arrive as 446. With soft deny the gateway answers 200 with a
-        # well-formed completion whose content is the guardrail's own failure text — no error
-        # object, no distinguishing status — so a reader that keys only on 446 files a blocked turn
-        # as a successful one and hands the operator an English internal message dressed as the
-        # model's answer. The hook says what really happened, so ask it: deny, or softDeny200.
         soft_denied = False
         for key, _ in _PHASES:
             for hook in (doc.get("hook_results") or {}).get(key) or []:
                 if isinstance(hook, dict) and (hook.get("deny") or hook.get("softDeny200")):
                     soft_denied = True
 
-        # 446 is the gateway's documented guardrail-denial status and `hooks_failed` the error type
-        # that rides with it. NOT a failure of the appliance: it is the control working.
+        # 446 또는 가드레일 차단 처리
         if status == 446 or err_type == "hooks_failed" or soft_denied:
             out.update({"ok": False, "code": "BLOCKED",
                         "error": err_msg or "the guardrail denied this turn"})
-            log.info("chat turn blocked by guardrail (status=%s, scan_id=%s)",
-                     status, out["scan"].get("scan_id", ""))
+            log.info("chat turn blocked by guardrail (status=%s, scan_id=%s, verdict=%s, latency=%dms)",
+                     status, out["scan"].get("scan_id", ""), out["scan"].get("verdict", ""), out["latency_ms"])
             return out
 
         if err_type or err_msg:
             out.update({"ok": False, "code": "UPSTREAM_ERROR", "upstream_type": err_type,
                         "error": err_msg or "the provider returned an error"})
-            log.warning("chat turn upstream error (status=%s, type=%s)", status, err_type)
+            log.warning("chat turn upstream error (status=%s, type=%s, msg=%s, latency=%dms)",
+                        status, err_type, err_msg[:100], out["latency_ms"])
             return out
 
         text = None
@@ -373,14 +360,20 @@ class GatewayService:
         if text is None:
             out.update({"ok": False, "code": "BAD_RESPONSE",
                         "error": "gateway response carried no completion"})
-            log.warning("chat turn had no completion (status=%s)", status)
+            log.warning("chat turn had no completion (status=%s, latency=%dms)", status, out["latency_ms"])
             return out
 
         out["ok"] = True
         out["reply"] = text
         if isinstance(doc.get("usage"), dict):
             out["usage"] = doc["usage"]
+
+        # [LOG] 최종 성공 로그 (소요 시간 및 응답 글자 수 기록)
+        log.info("chat turn completed successfully (status=%s, reply_chars=%d, latency=%dms)",
+                 status, len(text), out["latency_ms"])
+
         return out
+
 
     def complete_turn(self, model_req, message, system_prompt=None, history=None, session_id=""):
         """One non-retrieval turn: resolve the model, build the messages, call the gateway.

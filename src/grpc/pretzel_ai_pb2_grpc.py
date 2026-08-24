@@ -39,6 +39,66 @@ class PretzelAiStub(object):
                 request_serializer=pretzel__ai__pb2.ListDocumentsRequest.SerializeToString,
                 response_deserializer=pretzel__ai__pb2.DocumentList.FromString,
                 )
+        self.ListBenchmarkDatasets = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/ListBenchmarkDatasets',
+                request_serializer=pretzel__ai__pb2.ListBenchmarkDatasetsRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.BenchmarkDatasetList.FromString,
+                )
+        self.UploadBenchmarkDataset = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/UploadBenchmarkDataset',
+                request_serializer=pretzel__ai__pb2.UploadBenchmarkDatasetRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.UploadBenchmarkDatasetResult.FromString,
+                )
+        self.RenameBenchmarkDataset = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/RenameBenchmarkDataset',
+                request_serializer=pretzel__ai__pb2.RenameBenchmarkDatasetRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.BenchmarkDatasetResult.FromString,
+                )
+        self.DeleteBenchmarkDataset = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/DeleteBenchmarkDataset',
+                request_serializer=pretzel__ai__pb2.DeleteBenchmarkDatasetRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.DeleteBenchmarkDatasetResult.FromString,
+                )
+        self.GetBenchmarkSummary = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/GetBenchmarkSummary',
+                request_serializer=pretzel__ai__pb2.BenchmarkSummaryRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.BenchmarkSummary.FromString,
+                )
+        self.ListBenchmark = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/ListBenchmark',
+                request_serializer=pretzel__ai__pb2.ListBenchmarkRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.BenchmarkPage.FromString,
+                )
+        self.ExportBenchmarkDataset = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/ExportBenchmarkDataset',
+                request_serializer=pretzel__ai__pb2.ExportBenchmarkDatasetRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.ExportBenchmarkDatasetResult.FromString,
+                )
+        self.RunBenchtest = channel.unary_stream(
+                '/pretzel.ai.v1.PretzelAi/RunBenchtest',
+                request_serializer=pretzel__ai__pb2.RunBenchtestRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.RunProgress.FromString,
+                )
+        self.ListBenchtestRuns = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/ListBenchtestRuns',
+                request_serializer=pretzel__ai__pb2.ListBenchtestRunsRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.BenchtestRunList.FromString,
+                )
+        self.GetBenchtestRun = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/GetBenchtestRun',
+                request_serializer=pretzel__ai__pb2.GetBenchtestRunRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.BenchtestRunSummary.FromString,
+                )
+        self.ListBenchtestCases = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/ListBenchtestCases',
+                request_serializer=pretzel__ai__pb2.ListBenchtestCasesRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.BenchtestCaseList.FromString,
+                )
+        self.GetBenchtestCase = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/GetBenchtestCase',
+                request_serializer=pretzel__ai__pb2.GetBenchtestCaseRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.BenchtestCaseDetail.FromString,
+                )
 
 
 class PretzelAiServicer(object):
@@ -90,6 +150,108 @@ class PretzelAiServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListBenchmarkDatasets(self, request, context):
+        """--- Benchmark sets ---------------------------------------------------------------------
+
+        A set is one uploaded .jsonl. Several coexist: a result recorded last week was scored against
+        the set that existed last week, so an upload adds rather than replaces, and removal is an
+        explicit act. Every call is unary — the largest of them carries one file — so there is no
+        progress to stream and nothing to cancel.
+
+        Every stored set, newest first. Short by nature (one per uploaded file), so it is not paged.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UploadBenchmarkDataset(self, request, context):
+        """Store one uploaded file. The whole file travels in one message; the server parses it before
+        opening a transaction, so a malformed upload costs nothing and holds no locks.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RenameBenchmarkDataset(self, request, context):
+        """Change the label on a set. Never the prompts and never the digest: renaming a set must not
+        change what a result recorded against it means.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteBenchmarkDataset(self, request, context):
+        """Remove a set and its prompts.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetBenchmarkSummary(self, request, context):
+        """Composition of one set — the counts the header band needs, and the technique list its filter
+        is built from. Separate from ListBenchmark because it does not change as the operator pages.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListBenchmark(self, request, context):
+        """One page of a set, filtered, in the uploaded file's own order.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ExportBenchmarkDataset(self, request, context):
+        """A whole set back out as .jsonl. Separate from ListBenchmark rather than a very large page of
+        it: the listing is paged and filtered for a table, and an export that inherited either would
+        silently hand back part of a set under the set's name.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RunBenchtest(self, request, context):
+        """--- Benchtest runs ---------------------------------------------------------------------
+
+        Executing a set against the guardrail. Streaming for the same reason RefreshCorpus is: it
+        runs for minutes and the console holds a window open for it, and dropping the stream is how
+        it is cancelled — the runner marks the run cancelled rather than leaving it "running" and
+        blocking the next one.
+
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListBenchtestRuns(self, request, context):
+        """Runs that have already happened. Separate unary calls because a finished run is read long
+        after its stream ended — reopening the modal must not mean re-running anything.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetBenchtestRun(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListBenchtestCases(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetBenchtestCase(self, request, context):
+        """One case with the whole exchange. Apart from the listing because this is the megabytes:
+        nothing wants them until an operator opens a case and asks what actually happened.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PretzelAiServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -112,6 +274,66 @@ def add_PretzelAiServicer_to_server(servicer, server):
                     servicer.ListDocuments,
                     request_deserializer=pretzel__ai__pb2.ListDocumentsRequest.FromString,
                     response_serializer=pretzel__ai__pb2.DocumentList.SerializeToString,
+            ),
+            'ListBenchmarkDatasets': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListBenchmarkDatasets,
+                    request_deserializer=pretzel__ai__pb2.ListBenchmarkDatasetsRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.BenchmarkDatasetList.SerializeToString,
+            ),
+            'UploadBenchmarkDataset': grpc.unary_unary_rpc_method_handler(
+                    servicer.UploadBenchmarkDataset,
+                    request_deserializer=pretzel__ai__pb2.UploadBenchmarkDatasetRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.UploadBenchmarkDatasetResult.SerializeToString,
+            ),
+            'RenameBenchmarkDataset': grpc.unary_unary_rpc_method_handler(
+                    servicer.RenameBenchmarkDataset,
+                    request_deserializer=pretzel__ai__pb2.RenameBenchmarkDatasetRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.BenchmarkDatasetResult.SerializeToString,
+            ),
+            'DeleteBenchmarkDataset': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteBenchmarkDataset,
+                    request_deserializer=pretzel__ai__pb2.DeleteBenchmarkDatasetRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.DeleteBenchmarkDatasetResult.SerializeToString,
+            ),
+            'GetBenchmarkSummary': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetBenchmarkSummary,
+                    request_deserializer=pretzel__ai__pb2.BenchmarkSummaryRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.BenchmarkSummary.SerializeToString,
+            ),
+            'ListBenchmark': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListBenchmark,
+                    request_deserializer=pretzel__ai__pb2.ListBenchmarkRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.BenchmarkPage.SerializeToString,
+            ),
+            'ExportBenchmarkDataset': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExportBenchmarkDataset,
+                    request_deserializer=pretzel__ai__pb2.ExportBenchmarkDatasetRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.ExportBenchmarkDatasetResult.SerializeToString,
+            ),
+            'RunBenchtest': grpc.unary_stream_rpc_method_handler(
+                    servicer.RunBenchtest,
+                    request_deserializer=pretzel__ai__pb2.RunBenchtestRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.RunProgress.SerializeToString,
+            ),
+            'ListBenchtestRuns': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListBenchtestRuns,
+                    request_deserializer=pretzel__ai__pb2.ListBenchtestRunsRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.BenchtestRunList.SerializeToString,
+            ),
+            'GetBenchtestRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetBenchtestRun,
+                    request_deserializer=pretzel__ai__pb2.GetBenchtestRunRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.BenchtestRunSummary.SerializeToString,
+            ),
+            'ListBenchtestCases': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListBenchtestCases,
+                    request_deserializer=pretzel__ai__pb2.ListBenchtestCasesRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.BenchtestCaseList.SerializeToString,
+            ),
+            'GetBenchtestCase': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetBenchtestCase,
+                    request_deserializer=pretzel__ai__pb2.GetBenchtestCaseRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.BenchtestCaseDetail.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -193,5 +415,209 @@ class PretzelAi(object):
         return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListDocuments',
             pretzel__ai__pb2.ListDocumentsRequest.SerializeToString,
             pretzel__ai__pb2.DocumentList.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ListBenchmarkDatasets(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListBenchmarkDatasets',
+            pretzel__ai__pb2.ListBenchmarkDatasetsRequest.SerializeToString,
+            pretzel__ai__pb2.BenchmarkDatasetList.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def UploadBenchmarkDataset(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/UploadBenchmarkDataset',
+            pretzel__ai__pb2.UploadBenchmarkDatasetRequest.SerializeToString,
+            pretzel__ai__pb2.UploadBenchmarkDatasetResult.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def RenameBenchmarkDataset(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/RenameBenchmarkDataset',
+            pretzel__ai__pb2.RenameBenchmarkDatasetRequest.SerializeToString,
+            pretzel__ai__pb2.BenchmarkDatasetResult.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def DeleteBenchmarkDataset(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/DeleteBenchmarkDataset',
+            pretzel__ai__pb2.DeleteBenchmarkDatasetRequest.SerializeToString,
+            pretzel__ai__pb2.DeleteBenchmarkDatasetResult.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def GetBenchmarkSummary(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/GetBenchmarkSummary',
+            pretzel__ai__pb2.BenchmarkSummaryRequest.SerializeToString,
+            pretzel__ai__pb2.BenchmarkSummary.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ListBenchmark(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListBenchmark',
+            pretzel__ai__pb2.ListBenchmarkRequest.SerializeToString,
+            pretzel__ai__pb2.BenchmarkPage.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ExportBenchmarkDataset(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ExportBenchmarkDataset',
+            pretzel__ai__pb2.ExportBenchmarkDatasetRequest.SerializeToString,
+            pretzel__ai__pb2.ExportBenchmarkDatasetResult.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def RunBenchtest(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(request, target, '/pretzel.ai.v1.PretzelAi/RunBenchtest',
+            pretzel__ai__pb2.RunBenchtestRequest.SerializeToString,
+            pretzel__ai__pb2.RunProgress.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ListBenchtestRuns(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListBenchtestRuns',
+            pretzel__ai__pb2.ListBenchtestRunsRequest.SerializeToString,
+            pretzel__ai__pb2.BenchtestRunList.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def GetBenchtestRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/GetBenchtestRun',
+            pretzel__ai__pb2.GetBenchtestRunRequest.SerializeToString,
+            pretzel__ai__pb2.BenchtestRunSummary.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ListBenchtestCases(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListBenchtestCases',
+            pretzel__ai__pb2.ListBenchtestCasesRequest.SerializeToString,
+            pretzel__ai__pb2.BenchtestCaseList.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def GetBenchtestCase(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/GetBenchtestCase',
+            pretzel__ai__pb2.GetBenchtestCaseRequest.SerializeToString,
+            pretzel__ai__pb2.BenchtestCaseDetail.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

@@ -39,12 +39,15 @@ CATEGORIES = {
     "A": ("프롬프트 조작", "prompt_manipulation", "prompt"),
     "B": ("정보 유출", "data_leakage", "prompt+response"),
     "C": ("유해·부적절 응답", "harmful_output", "response"),
-    "D": ("에이전트·도구 오남용", "agent_tool_abuse", "tool"),
-    "E": ("오염된 컨텍스트 유입", "poisoned_context", "prompt"),
+    "D": ("오염된 컨텍스트 유입", "poisoned_context", "prompt"),
 }
 
-NORMAL_PER_CAT = 100
-ATTACK_PER_CAT = 200
+# Attack:benign stays 2:1. The instruction-shaped agent/tool-abuse bank that used to be category D
+# is out of the shipped set — measured detection on it was 0–5% and the blocks that did land came
+# from header wording rather than from the payload, so it was reporting noise as coverage. What it
+# covered is written up separately as out-of-scope for this deployment model.
+NORMAL_PER_CAT = 125
+ATTACK_PER_CAT = 250
 
 # mix : ko : en = 65 : 20 : 15
 LANG_MIX = {"mix": 65, "ko": 20, "en": 15}
@@ -55,19 +58,16 @@ BUILDERS = {
     ("B", "malicious"): {"ko": T.b_ko, "en": T.b_en, "mix": T.b_mix},
     ("C", "malicious"): {"ko": T.c_ko, "en": T.c_en, "mix": T.c_mix},
     ("D", "malicious"): {"ko": T.d_ko, "en": T.d_en, "mix": T.d_mix},
-    ("E", "malicious"): {"ko": T.e_ko, "en": T.e_en, "mix": T.e_mix},
     ("A", "benign"): {"ko": T.na_ko, "en": T.na_en, "mix": T.na_mix},
     ("B", "benign"): {"ko": T.nb_ko, "en": T.nb_en, "mix": T.nb_mix},
     ("C", "benign"): {"ko": T.nc_ko, "en": T.nc_en, "mix": T.nc_mix},
-    ("D", "benign"): {"ko": T.nd_ko, "en": T.nd_en, "mix": T.nd_mix},
-    ("E", "benign"): {"ko": T.ne_ko, "en": T.ne_en, "mix": T.ne_mix},
+    ("D", "benign"): {"ko": T.ne_ko, "en": T.ne_en, "mix": T.ne_mix},
 }
 
 # Default scan target and expected hit labels per category, overridable by a builder's return.
-DEFAULT_TARGET = {"A": "prompt", "B": "prompt", "C": "response", "D": "tool", "E": "prompt"}
+DEFAULT_TARGET = {"A": "prompt", "B": "prompt", "C": "response", "D": "prompt"}
 DEFAULT_LABELS = {
-    "A": ["injection"], "B": ["dlp"], "C": ["toxic_content"],
-    "D": ["agent"], "E": ["injection"],
+    "A": ["injection"], "B": ["dlp"], "C": ["toxic_content"], "D": ["injection"],
 }
 
 
@@ -78,33 +78,24 @@ def lang_counts(total):
     return counts
 
 
-# Surface phrasing variety, language-aware and meaning-preserving. Real users do not send the same
-# request twice the same way — they open with "음," or "혹시", they close with "부탁해요" or "빨리 좀".
-# Modelling that is legitimate variety, not noise: it multiplies each frame's distinct renderings so
-# the benchmark measures a detector, not its ability to memorise one wording. An empty lead-in and an
-# empty tail are in each pool, so plenty of prompts stay bare. Applied only to single-line prompts —
-# the multi-line RAG payloads (category E) carry their own structure and get a tail only.
-_ENV = {
-    "ko":  {"lead": ["", "", "", "음, ", "혹시 ", "저기 ", "잠깐, ", "그, "],
-            "tail": ["", "", "", " 부탁해요.", " 좀 부탁해.", " 빨리 좀.", " 고마워.", " 가능할까?"]},
-    "en":  {"lead": ["", "", "", "Hey, ", "Quick one — ", "So, ", "Okay, ", "Right, "],
-            "tail": ["", "", "", " Thanks.", " Please.", " ASAP please.", " Appreciate it.", " if you can."]},
-    "mix": {"lead": ["", "", "", "음, ", "혹시 ", "잠깐, ", "quick하게, ", "저기, "],
-            "tail": ["", "", "", " 부탁해요.", " 좀 부탁해.", " asap 부탁.", " 고마워.", " 가능할까?"]},
-}
+# Every prompt is a multi-line work item — a header, a scope line, numbered directives, a closing
+# constraint. Earlier revisions wrapped each frame in a colloquial lead-in and sign-off ("음,", "빨리
+# 좀") to multiply the distinct renderings. That variety was real but the register was wrong: the
+# guardrail under test sits in front of an enterprise assistant, where the traffic reads like a
+# ticket, not like chat — and colloquial jailbreak theatre is the easiest thing in the world for a
+# filter to catch, so measuring it flatters the product. Variety now comes from the banks, which
+# vary header, scope and directive independently.
+MIN_LINES = 3
 
 
-def envelope(text, lang, multiline):
-    env = _ENV[lang]
-    tail = random_rng.choice(env["tail"])
-    if multiline:
-        return text + tail          # a lead-in before a "[document]…" block would read wrong
-    lead = random_rng.choice(env["lead"])
-    # Don't capital-clash: if we prepend an English lead-in, lowercase the original first letter only
-    # when it started a plain sentence (not an ID, bracket, or quote).
-    if lead and lang == "en" and text[:1].isupper() and text[1:2].islower():
-        text = text[0].lower() + text[1:]
-    return lead + text + tail
+def check_shape(text, cat, verdict, lang):
+    """Enforce the floor on prompt structure. A bank that regresses to a one-liner fails the build
+    rather than quietly shipping a row that does not match the documented format."""
+    n = len(text.splitlines())
+    if n < MIN_LINES:
+        sys.exit(f"[FATAL] bank ({cat},{verdict},{lang}) emitted a {n}-line prompt; the minimum is "
+                 f"{MIN_LINES}.\n--- offending prompt ---\n{text}\n-----------------------")
+    return text
 
 
 def call_builder(fn, verdict, cat):
@@ -145,7 +136,7 @@ def call_builder(fn, verdict, cat):
 def severity_for(cat, verdict):
     if verdict == "benign":
         return "none"
-    return {"A": "high", "B": "high", "C": "high", "D": "critical", "E": "high"}[cat]
+    return {"A": "high", "B": "high", "C": "high", "D": "high"}[cat]
 
 
 def build(seed):
@@ -172,7 +163,7 @@ def build(seed):
                 sys.exit(f"[FATAL] bank ({cat},{verdict},{lang}) too small for {n} unique prompts "
                          f"— only produced {made}. Add templates.")
             text, technique, labels, target = call_builder(fn, verdict, cat)
-            text = envelope(text, lang, multiline="\n" in text)
+            text = check_shape(text, cat, verdict, lang)
             key = (cat, text)
             if key in seen:
                 continue
@@ -219,6 +210,11 @@ CSV_FIELDS = [
     ("expected", "기대판정"),
     ("scan_target", "검사방향"),
     ("language", "언어"),
+    # technique and the expected detector are what every per-bank analysis keys on — a review
+    # sheet without them can show that a prompt failed but not which family it belongs to or
+    # which detector was supposed to catch it.
+    ("technique", "기법"),
+    ("expected_labels", "기대디텍터"),
     ("severity", "위험도"),
     ("prompt", "프롬프트"),
 ]
@@ -234,8 +230,14 @@ def write_csv(rows, path):
         for r in rows:
             w.writerow([
                 r["id"], r["category_ko"], VERDICT_KO[r["verdict"]], r["expected"],
-                r["scan_target"], LANG_KO[r["language"]], r["severity"],
-                r["prompt"].replace("\n", " ⏎ "),   # keep one row per prompt in a spreadsheet
+                r["scan_target"], LANG_KO[r["language"]], r["technique"],
+                # Comma-joined rather than a JSON array: the sheet is read by a person, and
+                # ["injection"] in a cell is punctuation nobody asked for.
+                ", ".join(r["expected_labels"]), r["severity"],
+                # Real line breaks, kept inside the quoted cell. Every prompt is a four- or
+                # five-line work item now, so flattening them to " ⏎ " turned the review column
+                # into a run-on; a quoted cell is still one CSV record, and Excel wraps it.
+                r["prompt"],
             ])
 
 

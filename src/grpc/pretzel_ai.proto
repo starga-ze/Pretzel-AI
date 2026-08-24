@@ -32,6 +32,58 @@ service PretzelAi {
   // The documents under one product/book, for the corpus browser. Titles and URLs only — the
   // bodies are what the assistant reads, not what an operator scrolls.
   rpc ListDocuments(ListDocumentsRequest) returns (DocumentList);
+
+  // --- Benchmark sets ---------------------------------------------------------------------
+  //
+  // A set is one uploaded .jsonl. Several coexist: a result recorded last week was scored against
+  // the set that existed last week, so an upload adds rather than replaces, and removal is an
+  // explicit act. Every call is unary — the largest of them carries one file — so there is no
+  // progress to stream and nothing to cancel.
+
+  // Every stored set, newest first. Short by nature (one per uploaded file), so it is not paged.
+  rpc ListBenchmarkDatasets(ListBenchmarkDatasetsRequest) returns (BenchmarkDatasetList);
+
+  // Store one uploaded file. The whole file travels in one message; the server parses it before
+  // opening a transaction, so a malformed upload costs nothing and holds no locks.
+  rpc UploadBenchmarkDataset(UploadBenchmarkDatasetRequest) returns (UploadBenchmarkDatasetResult);
+
+  // Change the label on a set. Never the prompts and never the digest: renaming a set must not
+  // change what a result recorded against it means.
+  rpc RenameBenchmarkDataset(RenameBenchmarkDatasetRequest) returns (BenchmarkDatasetResult);
+
+  // Remove a set and its prompts.
+  rpc DeleteBenchmarkDataset(DeleteBenchmarkDatasetRequest) returns (DeleteBenchmarkDatasetResult);
+
+  // Composition of one set — the counts the header band needs, and the technique list its filter
+  // is built from. Separate from ListBenchmark because it does not change as the operator pages.
+  rpc GetBenchmarkSummary(BenchmarkSummaryRequest) returns (BenchmarkSummary);
+
+  // One page of a set, filtered, in the uploaded file's own order.
+  rpc ListBenchmark(ListBenchmarkRequest) returns (BenchmarkPage);
+
+  // A whole set back out as .jsonl. Separate from ListBenchmark rather than a very large page of
+  // it: the listing is paged and filtered for a table, and an export that inherited either would
+  // silently hand back part of a set under the set's name.
+  rpc ExportBenchmarkDataset(ExportBenchmarkDatasetRequest) returns (ExportBenchmarkDatasetResult);
+
+  // --- Benchtest runs ---------------------------------------------------------------------
+  //
+  // Executing a set against the guardrail. Streaming for the same reason RefreshCorpus is: it
+  // runs for minutes and the console holds a window open for it, and dropping the stream is how
+  // it is cancelled — the runner marks the run cancelled rather than leaving it "running" and
+  // blocking the next one.
+
+  rpc RunBenchtest(RunBenchtestRequest) returns (stream RunProgress);
+
+  // Runs that have already happened. Separate unary calls because a finished run is read long
+  // after its stream ended — reopening the modal must not mean re-running anything.
+  rpc ListBenchtestRuns(ListBenchtestRunsRequest) returns (BenchtestRunList);
+  rpc GetBenchtestRun(GetBenchtestRunRequest) returns (BenchtestRunSummary);
+  rpc ListBenchtestCases(ListBenchtestCasesRequest) returns (BenchtestCaseList);
+
+  // One case with the whole exchange. Apart from the listing because this is the megabytes:
+  // nothing wants them until an operator opens a case and asks what actually happened.
+  rpc GetBenchtestCase(GetBenchtestCaseRequest) returns (BenchtestCaseDetail);
 }
 
 // One earlier turn of the conversation, replayed so the model — and the guardrail — can see what
@@ -139,4 +191,309 @@ message DocumentSummary {
 message DocumentList {
   repeated DocumentSummary documents = 1;
   string error = 2;
+}
+
+// --- Benchmark sets ----------------------------------------------------------------------
+
+// One uploaded file. `content_sha` is the digest of the bytes, hex-encoded — it is what makes a
+// re-upload recognisable rather than duplicated, and what identifies the exact file a result was
+// scored against.
+message BenchmarkDataset {
+  int64  id          = 1;
+  string name        = 2;
+  string filename    = 3;
+  string content_sha = 4;
+  int64  byte_size   = 5;
+  int32  row_count   = 6;
+  string note        = 7;
+  string uploaded_by = 8;
+  string uploaded_at = 9;   // ISO-8601
+}
+
+message ListBenchmarkDatasetsRequest {
+  string search = 1;   // substring over name and filename; "" -> all
+}
+
+message BenchmarkDatasetList {
+  repeated BenchmarkDataset datasets = 1;
+  string error = 2;
+}
+
+message UploadBenchmarkDatasetRequest {
+  bytes  content     = 1;   // the .jsonl, whole
+  string filename    = 2;
+  string name        = 3;   // "" -> derived from filename
+  string note        = 4;
+  string uploaded_by = 5;
+}
+
+// Three outcomes, and they are deliberately not collapsed into one error string:
+//
+//   dataset set, duplicate false   stored
+//   dataset set, duplicate true    these exact bytes were already here; `dataset` is that set,
+//                                  and nothing was created. Not a failure — the console points at
+//                                  the set instead of reporting an error for work already done.
+//   error set                      the file could not be read. `problems` carries the per-line
+//                                  detail, already capped, so the operator can fix the file
+//                                  rather than guess at what was wrong with it.
+message UploadBenchmarkDatasetResult {
+  BenchmarkDataset dataset = 1;
+  bool   duplicate = 2;
+  string error     = 3;
+  repeated string problems = 4;
+}
+
+message RenameBenchmarkDatasetRequest {
+  int64  dataset_id = 1;
+  string name       = 2;
+  string note       = 3;
+}
+
+message BenchmarkDatasetResult {
+  BenchmarkDataset dataset = 1;
+  string error = 2;        // set when the id does not exist
+}
+
+message DeleteBenchmarkDatasetRequest {
+  int64 dataset_id = 1;
+}
+
+message DeleteBenchmarkDatasetResult {
+  bool   deleted = 1;      // false means there was nothing under that id
+  string error   = 2;
+}
+
+message BenchmarkSummaryRequest {
+  int64 dataset_id = 1;
+}
+
+// One bucket of a breakdown: "A" -> 375, "malicious" -> 1000, "ko" -> 300.
+message BenchmarkBucket {
+  string key   = 1;
+  int32  count = 2;
+}
+
+// A technique with the category it belongs to, so the console's dropdown narrows with the
+// category chips instead of listing every bank in the set at once.
+message BenchmarkTechnique {
+  string category  = 1;
+  string technique = 2;
+  int32  count     = 3;
+}
+
+message BenchmarkSummary {
+  BenchmarkDataset dataset = 1;
+  repeated BenchmarkBucket    by_category = 2;
+  repeated BenchmarkBucket    by_verdict  = 3;
+  repeated BenchmarkBucket    by_language = 4;
+  repeated BenchmarkTechnique techniques  = 5;
+  string error = 6;
+}
+
+message ListBenchmarkRequest {
+  int64 dataset_id = 1;
+  // Empty means "no filter on this column". The server checks each name against its own closed
+  // set and drops the ones it does not know, so a stale console still gets the table back.
+  string category  = 2;
+  string verdict   = 3;
+  string language  = 4;
+  string technique = 5;
+  string search    = 6;   // substring over prompt text and prompt id
+  int32  offset    = 7;
+  int32  limit     = 8;   // server-capped
+
+  // "row_no" (the file's own order, the default) or "prompt_id". Anything else is ignored rather
+  // than refused — an ordering the server does not know is not a reason to withhold the table.
+  string order_by   = 9;
+  bool   descending = 10;
+}
+
+// One prompt, as the uploaded file carried it. `extra` is whatever fields the file had that the
+// schema has no column for, as a JSON object — kept so the stored set is not a lossy copy.
+message BenchmarkRow {
+  int32  row_no          = 1;   // position in the file, 1-based
+  string prompt_id       = 2;
+  string category        = 3;
+  string category_ko     = 4;
+  string category_en     = 5;
+  string verdict         = 6;   // malicious | benign
+  string expected        = 7;   // block | allow
+  string scan_target     = 8;   // prompt | response | tool
+  string language        = 9;   // mix | ko | en
+  string technique       = 10;
+  repeated string expected_labels = 11;
+  string severity        = 12;
+  string origin          = 13;
+  string prompt          = 14;
+  string extra_json      = 15;
+}
+
+message BenchmarkPage {
+  int32  total  = 1;   // matching the filter, not the page
+  int32  offset = 2;
+  int32  limit  = 3;
+  repeated BenchmarkRow rows = 4;
+  string error = 5;
+}
+
+message ExportBenchmarkDatasetRequest {
+  int64 dataset_id = 1;
+}
+
+message ExportBenchmarkDatasetResult {
+  bytes  content  = 1;   // the whole set, one JSON object per line
+  string filename = 2;   // what it arrived as, for the download name
+  int32  row_count = 3;
+  string error    = 4;
+}
+
+// --- Benchtest runs ----------------------------------------------------------------------
+
+// The scope is the console's filter, forwarded rather than resolved here: pretzel-ai already
+// applies the same filter to list the table, so the caller never has to know which prompts are in.
+message RunBenchtestRequest {
+  int64  dataset_id = 1;
+  string category   = 2;
+  string verdict    = 3;
+  string language   = 4;
+  string technique  = 5;
+  string search     = 6;
+  int32  workers    = 7;   // 0 -> the server's default
+  string label      = 8;   // the run's name; "" -> the server does not name it
+  string note       = 9;   // why it was made; optional
+}
+
+// One finished case, as the live list renders it. The request and response documents are NOT here
+// — they are in the database, and streaming them per case would push megabytes through a window
+// that shows one line each.
+message RunCase {
+  int32  seq        = 1;
+  string prompt_id  = 2;
+  string category   = 3;
+  string technique  = 4;
+  string language   = 5;
+  string expected   = 6;   // block | allow
+  string verdict    = 7;   // what the gateway did
+  repeated string detectors = 8;
+  string cause      = 9;   // the scored outcome
+  bool   ok         = 10;
+  bool   excluded   = 11;  // ok is not meaningful: uninspected, or the call failed
+  int32  latency_ms = 12;
+  string prompt     = 13;   // joined from the set, so a run lists the way the set does
+}
+
+message RunTally {
+  string key   = 1;   // a cause
+  int32  count = 2;
+}
+
+message RunProgress {
+  string stage   = 1;   // started | case | finished | empty | failed
+  int64  run_id  = 2;
+  int32  done    = 3;
+  int32  total   = 4;
+  bool   final   = 5;   // true exactly once, on the last message
+  string status  = 6;   // set on the last message: done | cancelled | failed
+  string error   = 7;
+  RunCase last_case = 8;          // set on stage "case"
+  repeated RunTally tally = 9;    // running totals by cause
+}
+
+message BenchtestRun {
+  int64  id          = 1;
+  int64  dataset_id  = 2;
+  string f_category  = 3;
+  string f_verdict   = 4;
+  string f_language  = 5;
+  string f_technique = 6;
+  string f_search    = 7;
+  int32  selected    = 8;
+  string status      = 9;
+  string error       = 10;
+  string model       = 11;
+  string started_at  = 12;
+  string ended_at    = 13;
+  string label       = 14;
+  string note        = 15;
+}
+
+message ListBenchtestRunsRequest {
+  int64 dataset_id = 1;   // 0 -> every set
+  int32 limit      = 2;
+}
+
+message BenchtestRunList {
+  repeated BenchtestRun runs = 1;
+  string error = 2;
+}
+
+message GetBenchtestRunRequest {
+  int64  run_id    = 1;
+  // The rates are computed over this scope; the breakdown chips stay run-wide.
+  string category  = 2;
+  string verdict   = 3;
+  string language  = 4;
+  string technique = 5;
+  string search    = 6;
+}
+
+message BenchtestRunSummary {
+  BenchtestRun run = 1;
+  repeated RunTally tally = 2;
+  // Breakdowns of the cases this run holds, for the Result tab's chips.
+  repeated BenchmarkBucket by_category  = 7;
+  repeated BenchmarkBucket by_verdict   = 8;
+  repeated BenchmarkBucket by_language  = 9;
+  repeated BenchmarkTechnique techniques = 10;
+  // The two rates the report needs, and the gap between them is the point: attacks the model
+  // itself refused never produced anything for the profile to scan.
+  int32 detected = 3;   // attacks scored as caught
+  int32 ruled    = 4;   // attacks that got a verdict at all (the raw denominator)
+  int32 refused  = 5;   // of those, the ones the model declined
+  string error   = 6;
+}
+
+message ListBenchtestCasesRequest {
+  int64  run_id    = 1;
+  string cause     = 2;   // "" -> every outcome
+  int32  offset    = 3;
+  int32  limit     = 4;
+  // The same scope filters the Test tab has, applied within a run's cases.
+  string category  = 5;
+  string verdict   = 6;
+  string language  = 7;
+  string technique = 8;
+  string search    = 9;
+  string order_by   = 10;  // "seq" (the run's order, the default) or "prompt_id"
+  bool   descending = 11;
+}
+
+message BenchtestCaseList {
+  int32 total  = 1;
+  int32 offset = 2;
+  int32 limit  = 3;
+  repeated RunCase cases = 4;
+  string error = 5;
+}
+
+message GetBenchtestCaseRequest {
+  int64 run_id = 1;
+  int32 seq    = 2;
+}
+
+// The four things the case drawer shows, named for what they are rather than for how they are
+// stored: the prompt that was meant to be sent, the model's answer, and the two envelopes those
+// travelled in. Showing the prompt beside the raw request is the point — a disputed verdict is
+// settled by seeing that what went out was what was meant to go out.
+message BenchtestCaseDetail {
+  RunCase summary      = 1;
+  string  scan_id      = 2;
+  string  caught       = 3;
+  int32   http_status  = 4;
+  string  prompt       = 5;   // Request (prompt): the set's prompt for this case
+  string  response     = 6;   // Response: the model's text
+  string  raw_request  = 7;   // Raw request: the whole request that was sent
+  string  raw_response = 8;   // Raw response: the whole document that came back
+  string  tool_calls   = 9;
+  string  error        = 10;
 }
