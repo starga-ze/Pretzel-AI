@@ -24,6 +24,11 @@ class PretzelAiStub(object):
                 request_serializer=pretzel__ai__pb2.ChatRequest.SerializeToString,
                 response_deserializer=pretzel__ai__pb2.ChatChunk.FromString,
                 )
+        self.ListModels = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/ListModels',
+                request_serializer=pretzel__ai__pb2.ListModelsRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.ModelList.FromString,
+                )
         self.RefreshCorpus = channel.unary_stream(
                 '/pretzel.ai.v1.PretzelAi/RefreshCorpus',
                 request_serializer=pretzel__ai__pb2.RefreshCorpusRequest.SerializeToString,
@@ -113,6 +118,19 @@ class PretzelAiServicer(object):
         """One chat turn. The reply is a stream of chunks; the final chunk has done=true and carries
         the turn-level outcome (usage, and later the AIRS scan verdict — see the old
         gateway_service.extract_scan for the shape those fields will take).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListModels(self, request, context):
+        """Which models this appliance may ask for. Answered from prisma-airs/config.json, which is the
+        one place that knows — the gateway account decides what is reachable, so this is a fact about
+        the daemon and not a declaration the operator makes. That is why it comes back over the wire
+        instead of riding in running_config: a catalog committed there would be diffed and rolled back
+        like a policy, and rolling the configuration back does not put a model back in the gateway
+        account. Same reasoning as GetCorpusStatus, which reports what the store holds rather than
+        what someone declared it should hold.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -260,6 +278,11 @@ def add_PretzelAiServicer_to_server(servicer, server):
                     request_deserializer=pretzel__ai__pb2.ChatRequest.FromString,
                     response_serializer=pretzel__ai__pb2.ChatChunk.SerializeToString,
             ),
+            'ListModels': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListModels,
+                    request_deserializer=pretzel__ai__pb2.ListModelsRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.ModelList.SerializeToString,
+            ),
             'RefreshCorpus': grpc.unary_stream_rpc_method_handler(
                     servicer.RefreshCorpus,
                     request_deserializer=pretzel__ai__pb2.RefreshCorpusRequest.FromString,
@@ -364,6 +387,23 @@ class PretzelAi(object):
         return grpc.experimental.unary_stream(request, target, '/pretzel.ai.v1.PretzelAi/Chat',
             pretzel__ai__pb2.ChatRequest.SerializeToString,
             pretzel__ai__pb2.ChatChunk.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ListModels(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListModels',
+            pretzel__ai__pb2.ListModelsRequest.SerializeToString,
+            pretzel__ai__pb2.ModelList.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 

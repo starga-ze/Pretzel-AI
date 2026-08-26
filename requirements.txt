@@ -8,3 +8,17 @@ grpcio-tools==1.62.1
 # reasonable time. pretzel-ai is the sole writer of this database; engined remains the sole
 # writer of the `pretzel` configuration database.
 psycopg[binary]==3.2.3
+
+# The Portkey gateway client. Not needed to make the call — src/gateway.py speaks the same HTTP
+# with urllib — but a customer deployment is easier to reason about when the appliance uses the
+# vendor's own SDK: their docs, their examples, their retry and timeout defaults.
+#
+# Two things about it are load-bearing here and were verified before pinning:
+#   - a successful turn keeps `hook_results` on the response (r.model_dump() has it), so
+#     gateway.extract_scan() reads the AIRS verdict unchanged;
+#   - a guardrail block arrives as APIStatusError (446), and the hook results survive on
+#     e.response.json(). Reading the verdict off the EXCEPTION is what keeps "was this turn
+#     inspected" separate from "did this turn succeed" — see the note at the top of gateway.py.
+# A future version that drops either of those breaks the console's scan panel silently, which is
+# why this is pinned rather than floating.
+portkey-ai==2.3.4

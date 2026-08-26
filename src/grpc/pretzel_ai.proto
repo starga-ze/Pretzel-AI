@@ -13,6 +13,15 @@ service PretzelAi {
   // gateway_service.extract_scan for the shape those fields will take).
   rpc Chat(ChatRequest) returns (stream ChatChunk);
 
+  // Which models this appliance may ask for. Answered from prisma-airs/config.json, which is the
+  // one place that knows — the gateway account decides what is reachable, so this is a fact about
+  // the daemon and not a declaration the operator makes. That is why it comes back over the wire
+  // instead of riding in running_config: a catalog committed there would be diffed and rolled back
+  // like a policy, and rolling the configuration back does not put a model back in the gateway
+  // account. Same reasoning as GetCorpusStatus, which reports what the store holds rather than
+  // what someone declared it should hold.
+  rpc ListModels(ListModelsRequest) returns (ModelList);
+
   // --- The tech-doc knowledge base -------------------------------------------------------
   //
   // The assistant answers out of a corpus crawled from docs.paloaltonetworks.com, and Palo Alto
@@ -110,6 +119,21 @@ message ChatRequest {
   // it AIRS mints a fresh id per call, so every turn lands in its own session and the Sessions view
   // can never show a conversation. "" -> let AIRS generate one.
   string session_id = 5;
+
+  // One thing the operator asked for. Issued by mgmtd when the turn arrives, and constant for as
+  // long as pretzel-ai works on it — which, once tool calls are in play, is several LLM round
+  // trips rather than one. That is the whole reason it exists as a separate field: the agent loop
+  // makes "a request" and "a model call" different units, and a scan can only be traced back to
+  // the person who caused it if something survives the loop.
+  //
+  // The three ids nest, coarsest first:
+  //   session_id      the conversation        (the browser mints it, cv_*)
+  //   transaction_id  one operator request    (mgmtd, this field)
+  //   tr_id           one LLM round trip      (pretzel-ai, per iteration; not on the wire)
+  //
+  // AIRS carries all three, so a scan report can be read at whichever level the question is
+  // being asked at. "" -> pretzel-ai proceeds without one; it is a tracing aid, not a gate.
+  string transaction_id = 6;
 }
 
 message ChatChunk {
@@ -121,6 +145,21 @@ message ChatChunk {
   // verdict, usage, ok/code — the same shape the old inferd ChatResponse IPC payload carried,
   // which mgmtd files verbatim and the console parses. Empty on non-final chunks.
   string result_json = 4;
+}
+
+message ListModelsRequest {}
+
+message Model {
+  string id = 1;        // "@openai/gpt-4o-2024-11-20" — sent to the gateway verbatim; the
+                        // @<integration-slug>/<model> form is Portkey's own routing syntax
+  string label = 2;     // "GPT-4o" — what the picker shows
+  string provider = 3;  // "OpenAI" — display only, derived from the slug when unset
+}
+
+message ModelList {
+  repeated Model models = 1;
+  string default_model = 2;  // the id the picker starts on; "" when the catalog is empty
+  string error = 3;          // set only when the catalog could not be read
 }
 
 // --- Tech-doc corpus ---------------------------------------------------------------------

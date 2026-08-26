@@ -30,7 +30,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory={root}
-ExecStart={python} -m src.grpc.server --listen {listen}
+# Baked in at `start` time from the environment, so raising the level is one command and the unit
+# on disk records what the running daemon was told. DEBUG makes the daemon dump the text operators
+# typed (see PretzelAiServicer.Chat), which is why it is not the default and not a runtime toggle.
+Environment="PZ_PRETZEL_AI_LOG_LEVEL={log_level}"
+ExecStart={python} -m src.main --listen {listen}
 Restart=always
 RestartSec=3
 # The app writes {log_file} itself; journald keeps a copy of stdout/stderr for early failures.
@@ -67,15 +71,16 @@ def _wait_until_serving(timeout_sec=15):
 def _stop_stray_server():
     """Kill any server process not managed by the unit, whatever module path it was launched on.
 
-    The pattern covers `src.server` as well as today's `src.grpc.server`: an appliance upgraded
-    across that move can still be running the old path, and it holds the listen port exactly as a
-    stray manual run would — a restart of the unit alone would then come up unable to bind.
+    The pattern covers every module path this daemon has been launched on — `src.server`, then
+    `src.grpc.server`, and today's `src.main`. An appliance upgraded across one of those moves can
+    still be running the old path, and it holds the listen port exactly as a stray manual run
+    would — a restart of the unit alone would then come up unable to bind.
     """
     # `--` before the pattern: it starts with "-m", which pkill would otherwise parse as an option
     # and answer with its usage text. Output is swallowed either way — pkill exits non-zero when
     # nothing matched, which is the normal case here and not something to report.
     # The regex is extended (…)? not BRE \(…\)?, which is what pkill -f matches with.
-    subprocess.run(["pkill", "-f", "--", r"-m src\.(grpc\.)?server"],
+    subprocess.run(["pkill", "-f", "--", r"-m src\.((grpc\.)?server|main)\b"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
@@ -93,7 +98,17 @@ def run():
 
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    unit = UNIT_TEMPLATE.format(root=ROOT_DIR, python=VENV_PY, listen=LISTEN, log_file=LOG_FILE)
+    # info unless the operator asked for otherwise on this very command; an unrecognised value
+    # falls back rather than baking a level the daemon will refuse to start on.
+    level = os.environ.get("PZ_PRETZEL_AI_LOG_LEVEL", "info").lower()
+    if level not in ("debug", "info", "warning", "error"):
+        print(f"[!] unknown PZ_PRETZEL_AI_LOG_LEVEL '{level}' — using info")
+        level = "info"
+    if level == "debug":
+        print("[!] log level DEBUG: the daemon will dump the text operators type")
+
+    unit = UNIT_TEMPLATE.format(root=ROOT_DIR, python=VENV_PY, listen=LISTEN, log_file=LOG_FILE,
+                                log_level=level)
     with open(SERVICE_PATH, "w") as f:
         f.write(unit)
     print(f"[*] Wrote {SERVICE_PATH}")

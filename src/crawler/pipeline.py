@@ -1,5 +1,14 @@
 """The crawl: fetch every page the sitemap lists, keep the ones that are documents.
 
+Why the crawler lives in pretzel-ai rather than in one of the C++ daemons:
+Why this lives in pretzel-ai rather than in one of the C++ daemons: fetch, extract, hash and
+(later) embed are one pipeline, not four steps that happen to run in sequence. The decision to
+re-embed a page is made by comparing the hash of its *extracted* text against the stored one, so
+splitting extraction away from embedding would put a process and a language boundary through the
+middle of the only gate that keeps the embedding cost down. Two further facts settle it: the IPC
+fabric caps a frame at 1 MiB (shared/ipc/IpcProtocol.h) while the largest observed page body is
+1.3 MiB, and the extractor is DITA-shaped HTML work that has no reason to be rewritten in C++17.
+
 There is one operation and no incremental path. Every run re-reads the sitemap and re-fetches
 everything on it, which is slower than comparing timestamps and very much simpler: nothing is
 remembered between runs, so nothing between runs can be wrong. The staleness gates that used to

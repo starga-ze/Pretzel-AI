@@ -17,9 +17,16 @@ credentials are a later milestone.
 
 import json
 import logging
+import secrets
 import time
 import urllib.error
 import urllib.request
+
+# The vendor SDK. The gateway leg goes through it so a customer deployment is reading Portkey's
+# own client rather than our hand-rolled HTTP; the bypass leg cannot, because it points at a
+# provider endpoint with its own auth shape, so urllib stays for that one. Both legs converge on
+# the same (status, doc) pair below and share every line of interpretation after that.
+from portkey_ai import Portkey
 
 log = logging.getLogger("pretzel-ai.gateway")
 
@@ -31,6 +38,37 @@ _PHASES = (("before_request_hooks", "prompt"), ("after_request_hooks", "response
 _DETECTION_FIELDS = ("prompt_detected", "response_detected", "tool_detected")
 
 USER_AGENT = "pz-pretzel-ai/1.0"
+
+
+def new_tr_id():
+    """One LLM round trip. The innermost of the three ids a turn carries.
+
+    Minted here rather than taken from the caller because the unit it names is one this side owns:
+    with tool calls a single operator request becomes several model calls, and the prompt and the
+    response of each one have to be correlatable to each other and to nothing else. mgmtd's
+    transaction_id spans all of them; this does not.
+    """
+    return "tr_" + secrets.token_hex(8)
+
+# Display names for the integration slugs the catalog uses. A slug with no entry here is not
+# dropped — it is shown as-is, so a provider connected tomorrow appears under its own name rather
+# than under a blank one.
+_PROVIDER_LABELS = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "google": "Google",
+    "vertex-ai": "Vertex AI",
+    "azure-openai": "Azure OpenAI",
+    "bedrock": "Bedrock",
+}
+
+
+def _provider_of(model_id):
+    """"@openai/gpt-4o" -> "OpenAI". A bare model name has no slug and so no provider."""
+    if not model_id.startswith("@") or "/" not in model_id:
+        return ""
+    slug = model_id[1:].split("/", 1)[0]
+    return _PROVIDER_LABELS.get(slug, slug)
 
 
 def extract_scan(doc):
@@ -159,10 +197,91 @@ class GatewayService:
         self._gw = config
         self._models = {m["id"]: m for m in config.get("models", [])}
         self._credentials = credentials
+        # One SDK client per (base_url, key). Built on first use rather than in the constructor:
+        # a bad key should surface on the turn that used it, not by refusing to start the daemon.
+        self._clients = {}
+
+    # --- Transport -----------------------------------------------------------------------
+    #
+    # Two senders, one contract: (status, doc, transport_error). `status` is the HTTP code, `doc`
+    # the parsed body — INCLUDING for a guardrail block, because the hook results ride on the 446
+    # and losing them would turn "the guardrail denied this" into "something went wrong".
+
+    def _sdk_client(self, route, key):
+        """The SDK client for this route, or None when the route cannot be expressed through it."""
+        # The SDK owns the "/chat/completions" suffix; base_url is everything before it. A config
+        # pointing somewhere else is not an error — it just cannot go through the SDK, and falls
+        # back to urllib rather than being rewritten into a shape the operator did not ask for.
+        path = route["path"]
+        if not path.endswith("/chat/completions"):
+            return None
+        scheme = "https" if route.get("tls", True) else "http"
+        base = f"{scheme}://{route['host']}:{route.get('port', 443)}{path[: -len('/chat/completions')]}"
+
+        cached = self._clients.get(base)
+        if cached is None:
+            cached = Portkey(base_url=base, api_key=key)
+            self._clients[base] = cached
+        return cached
+
+    def _send_sdk(self, client, model, messages, token_param, headers, timeout):
+        """→ (status, doc, transport_error). Reads the verdict off the exception on a block."""
+        try:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, stream=False,
+                extra_headers=headers, timeout=timeout,
+                extra_body={token_param: self._gw.get("max_tokens", 4096)})
+            return 200, resp.model_dump(), ""
+        except Exception as exc:                    # noqa: BLE001 - classified by shape, below
+            # Not caught by class on purpose. The SDK raises openai.APIStatusError, but `openai` is
+            # vendored inside portkey_ai and is not importable here, so naming the class would mean
+            # reaching into a private path that a version bump can move. What matters is stable:
+            # an HTTP failure carries a response we can read, a transport failure does not.
+            response = getattr(exc, "response", None)
+            status = getattr(exc, "status_code", 0) or 0
+            if response is None or not status:
+                return 0, {}, str(exc)[:300]
+            try:
+                return status, response.json(), ""
+            except Exception:                       # noqa: BLE001 - a non-JSON error body
+                return status, {"__raw__": (getattr(response, "text", "") or "")[:400]}, ""
+
+    def _send_urllib(self, url, body, headers, timeout):
+        """→ (status, doc, transport_error). The bypass leg, and the SDK's fallback."""
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                status, raw = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            status, raw = e.code, e.read().decode("utf-8", "replace")
+            log.info("HTTP Error received from gateway: status=%d", status)
+        except (urllib.error.URLError, OSError) as e:
+            return 0, {}, str(getattr(e, "reason", e))
+        try:
+            return status, json.loads(raw), ""
+        except json.JSONDecodeError:
+            return status, {"__raw__": " ".join(raw.split())[:400]}, ""
 
     @property
     def default_model(self):
         return self._gw.get("default_model", "")
+
+    def catalog(self):
+        """The model list the console's picker is built from → [{id, label, provider}].
+
+        Derived from config.json rather than mirrored anywhere: the console asks for this over the
+        wire (ListModels) so there is exactly one list, and adding a model stays a one-file edit.
+        """
+        out = []
+        for m in self._gw.get("models", []):
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            # A model that names no provider gets one from its own routing slug, so the picker can
+            # group by provider without the catalog having to repeat itself.
+            provider = m.get("provider") or _provider_of(mid)
+            out.append({"id": mid, "label": m.get("label") or mid, "provider": provider})
+        return out
 
     def resolve_model(self, requested):
         """An unknown model is not silently substituted — the console shows which model answered,
@@ -239,14 +358,19 @@ class GatewayService:
             "credential_id": provider,
         }, ""
 
-    def complete(self, model, messages, session_id=""):
+    def complete(self, model, messages, session_id="", transaction_id=""):
         """Returns the response document the console consumes, whatever happened."""
         started = time.monotonic()
-        out = {"model": model}
+        tr_id = new_tr_id()
+        out = {"model": model, "tr_id": tr_id}
+        if transaction_id:
+            out["transaction_id"] = transaction_id
+        if session_id:
+            out["session_id"] = session_id
 
-        # [LOG] 요청 시작 로그 (모델, 메시지 수, 세션 ID 기록)
-        log.info("Starting complete request: model=%s, messages_count=%d, session_id=%s",
-                 model, len(messages), session_id or "(none)")
+        log.info("Starting complete request: model=%s, messages_count=%d, session=%s, txn=%s, tr=%s",
+                 model, len(messages), session_id or "(none)",
+                 transaction_id or "(none)", tr_id)
 
         # Which endpoint this turn goes to.
         route, route_err = self._resolve_route(model)
@@ -264,56 +388,64 @@ class GatewayService:
             log.error("Missing credentials for credential_id '%s'", route['credential_id'])
             return out
 
-        scheme = "https" if route.get("tls", True) else "http"
-        url = f"{scheme}://{route['host']}:{route.get('port', 443)}{route['path']}"
-        body = json.dumps({
-            "model": model,
-            "max_tokens": self._gw.get("max_tokens", 4096),
-            "messages": messages,
-            "stream": False,
-        }).encode()
+        # Which name the output cap goes out under is a per-model fact, not a global one: the gpt-5
+        # generation rejects `max_tokens` outright ("Unsupported parameter") and wants
+        # `max_completion_tokens`, while gpt-4o and Gemini take the old name. The catalog carries
+        # it so adding a model that flipped is a config edit, not a code edit; unset means the old
+        # name, which is what every model before this took.
+        token_param = (self._models.get(model) or {}).get("token_param", "max_tokens")
+        timeout = self._gw.get("timeout_sec", 45)
 
-        headers = {"Content-Type": "application/json",
-                   "User-Agent": USER_AGENT,
-                   route["api_key_header"]: route.get("api_key_prefix", "") + key}
-
-        headers.update(self._gw.get("headers") or {})
-
+        # Headers the SDK does not set for us. The api-key header is deliberately NOT here for the
+        # SDK leg — the client already holds the credential, and sending it twice under two names
+        # is how a rotated key ends up half-applied.
+        extra = dict(self._gw.get("headers") or {})
+        # The gateway leg can carry exactly one id: Portkey forwards x-portkey-trace-id to AIRS as
+        # its tr_id, and its plugin sets nothing else (see plugins/panw-prisma-airs/intercept.ts).
+        # session_id keeps that slot because grouping a thread in the AIRS console is the one thing
+        # the field can still buy here. The three-level scheme lands properly on the direct scan
+        # path, which sets tr_id, session_id and transaction_id as their own fields.
         if session_id:
-            headers["x-portkey-trace-id"] = session_id
+            extra["x-portkey-trace-id"] = session_id
 
-        # [LOG] 실제 HTTP 요청 전송 로그 (상세 URL 및 bypass 여부)
-        log.debug("Sending HTTP POST to %s (bypass=%s)", url, route.get("bypass", False))
+        client = None if route["bypass"] else self._sdk_client(route, key)
 
-        status, raw, transport_error = 0, "", ""
-        try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=self._gw.get("timeout_sec", 45)) as r:
-                status, raw = r.status, r.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            status, raw = e.code, e.read().decode("utf-8", "replace")
-            # [LOG] HTTP 에러 응답 수신 기록 (446 가드레일 등의 가능성)
-            log.info("HTTP Error received from gateway: status=%d", status)
-        except (urllib.error.URLError, OSError) as e:
-            transport_error = str(getattr(e, "reason", e))
+        if client is not None:
+            log.debug("Sending via Portkey SDK (model=%s)", model)
+            status, doc, transport_error = self._send_sdk(
+                client, model, messages, token_param, extra, timeout)
+        else:
+            scheme = "https" if route.get("tls", True) else "http"
+            url = f"{scheme}://{route['host']}:{route.get('port', 443)}{route['path']}"
+            body = json.dumps({
+                "model": model,
+                token_param: self._gw.get("max_tokens", 4096),
+                "messages": messages,
+                "stream": False,
+            }).encode()
+            headers = {"Content-Type": "application/json",
+                       "User-Agent": USER_AGENT,
+                       route["api_key_header"]: route.get("api_key_prefix", "") + key,
+                       **extra}
+            log.debug("Sending HTTP POST to %s (bypass=%s)", url, route.get("bypass", False))
+            status, doc, transport_error = self._send_urllib(url, body, headers, timeout)
 
         out["latency_ms"] = int((time.monotonic() - started) * 1000)
 
         if transport_error:
             out.update({"ok": False, "code": "UNREACHABLE",
                         "error": transport_error or "could not reach the gateway"})
-            log.warning("chat turn failed to leave (latency=%dms): %s", out["latency_ms"], transport_error)
+            log.warning("chat turn failed to leave (latency=%dms): %s",
+                        out["latency_ms"], transport_error)
             return out
 
-        try:
-            doc = json.loads(raw)
-        except json.JSONDecodeError as e:
-            detail = " ".join(raw.split())[:200]
+        # A body that would not parse is reported as itself rather than as a missing completion:
+        # "the gateway said something we could not read" and "the gateway said nothing" are
+        # different failures and lead an operator to different places.
+        if "__raw__" in doc:
             out.update({"ok": False, "code": "BAD_RESPONSE", "status": status,
-                        "error": f"gateway response was not JSON ({e}): {detail}"
-                                 if detail else f"gateway response was not JSON: {e}"})
-            log.warning("chat turn unreadable (status=%s, latency=%dms, body=%s)",
-                        status, out["latency_ms"], detail[:120])
+                        "error": f"gateway response was not JSON: {doc['__raw__']}"})
+            log.warning("chat turn unreadable (status=%s, latency=%dms)", status, out["latency_ms"])
             return out
 
         out["scan"] = extract_scan(doc)
@@ -375,7 +507,8 @@ class GatewayService:
         return out
 
 
-    def complete_turn(self, model_req, message, system_prompt=None, history=None, session_id=""):
+    def complete_turn(self, model_req, message, system_prompt=None, history=None, session_id="",
+                      transaction_id=""):
         """One non-retrieval turn: resolve the model, build the messages, call the gateway.
 
         Retrieval/grounding (the old chat_service.handle_turn) is intentionally not ported here —
@@ -391,4 +524,4 @@ class GatewayService:
 
         return self.complete(model,
                              self.build_messages(message, system_prompt or None, history),
-                             session_id)
+                             session_id, transaction_id)

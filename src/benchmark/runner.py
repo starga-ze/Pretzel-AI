@@ -24,6 +24,8 @@ open for it. The caller stops iterating to cancel, which is also how the crawl i
 
 import json
 import logging
+import random
+import re
 import time
 import urllib.error
 import urllib.request
@@ -56,6 +58,65 @@ DEFAULT_WORKERS = 8
 MAX_WORKERS = 16
 TIMEOUT_SEC = 60
 
+# Statuses worth trying again. 429 is the one that matters in practice — the provider's tokens-per
+# -minute ceiling, which a 1,500-prompt run across 8 workers walks straight into — but a 5xx from
+# the gateway or the provider is the same kind of nothing: the turn did not happen, and the case
+# has no result either way. 4xx that are not 429 are the request being wrong, and repeating a wrong
+# request is just a slower way to be wrong.
+RETRY_STATUSES = frozenset((408, 429, 500, 502, 503, 504))
+
+# Four attempts, not more. A run is thousands of calls and every retry costs a fresh AIRS scan as
+# well as a provider call; past this the honest answer is that the appliance is over its quota and
+# the run should be slowed down, not hammered harder.
+MAX_ATTEMPTS = 4
+BACKOFF_BASE_SEC = 0.6
+BACKOFF_CAP_SEC = 12.0
+
+# "Please try again in 162ms" / "in 1.5s" — OpenAI puts the exact figure in the error text, which
+# is better than any backoff we could guess. Read when there is no Retry-After header.
+_RETRY_HINT = re.compile(r"try again in\s+([0-9.]+)\s*(ms|s)\b", re.I)
+
+
+def _retry_after(headers, doc):
+    """How long the provider asked us to wait, in seconds, or None if it did not say."""
+    raw = ""
+    if headers:
+        try:
+            raw = headers.get("Retry-After") or headers.get("retry-after") or ""
+        except Exception:                           # noqa: BLE001 - odd header container
+            raw = ""
+    if raw:
+        try:
+            return max(0.0, float(raw))             # seconds form; the HTTP-date form is not used here
+        except ValueError:
+            pass
+
+    message = ""
+    if isinstance(doc, dict):
+        err = doc.get("error")
+        if isinstance(err, dict):
+            message = err.get("message", "") or ""
+        elif isinstance(err, str):
+            message = err
+    hit = _RETRY_HINT.search(message)
+    if hit:
+        value = float(hit.group(1))
+        return value / 1000.0 if hit.group(2).lower() == "ms" else value
+    return None
+
+
+def _backoff(attempt, asked):
+    """Seconds to sleep before `attempt` (1-based). The provider's own figure wins.
+
+    Jitter is not decoration here: eight workers rate-limited by the same bucket in the same second
+    would otherwise wake in the same second and collide again, turning one stall into a rhythm.
+    """
+    if asked is not None:
+        base = asked
+    else:
+        base = BACKOFF_BASE_SEC * (2 ** (attempt - 1))
+    return min(BACKOFF_CAP_SEC, base) * (1.0 + random.random() * 0.25)
+
 
 def _refused(reply):
     head = (reply or "")[:REFUSAL_HEAD].lower()
@@ -69,6 +130,21 @@ def classify(row, res):
         return None, "호출실패"
     if verdict == "not_inspected" or not res.get("scan_id"):
         return None, "미검사"
+
+    # A response-direction row is only scorable when there IS a response. When the turn never came
+    # back — rate-limited, timed out, refused by the provider — the gateway leaves
+    # after_request_hooks empty, so the guardrail was never handed the thing this row exists to
+    # test. Scored as a miss that reads "AIRS let harmful output through", which is a claim about a
+    # scan that did not happen; scored as a pass it pads the clean rate with a non-measurement.
+    # Either way the number stops being about the guardrail.
+    #
+    # The prompt direction is untouched by this: before_request_hooks run before the provider is
+    # called at all, so a prompt-target row has a complete verdict even when the turn died after
+    # it. A blocked turn is likewise a real outcome and keeps its verdict — there is no response
+    # precisely because the guardrail stopped it.
+    if verdict != "block" and row.get("scan_target") in ("response", "tool") \
+            and not res.get("completed"):
+        return None, "미검사(응답없음)"
 
     fired = set(res.get("detectors") or ())
     target = CAT_LABEL.get(row.get("category", ""))
@@ -107,41 +183,73 @@ class Caller:
     def __init__(self, config_path=CONFIG_PATH):
         gw, creds = pa_config.load(config_path)
         self.gw = gw
+        self._models = {m["id"]: m for m in gw.get("models", [])}
         self.key = creds.key("portkey")
         self.url = f"https://{gw['host']}{gw['path']}"
         self.model = gw.get("default_model", "")
 
     def __call__(self, case):
         row, run_id = case
+        # Same per-model output-cap name as the chat path (see gateway.complete): the gpt-5
+        # generation 400s on `max_tokens`. A run that 400ed every prompt would score as a run
+        # where the guardrail caught nothing, so this is not cosmetic here.
+        token_param = (self._models.get(self.model) or {}).get("token_param", "max_tokens")
         body = {"model": self.model,
-                "max_tokens": self.gw.get("max_tokens", 256), "stream": False,
+                token_param: self.gw.get("max_tokens", 256), "stream": False,
                 "messages": [{"role": "user", "content": row["prompt"]}]}
         # Agent rows declare the toolset, because Agent Protection inspects the agent surface and
         # a plain completion carries none of it.
         payload = json.dumps(body).encode()
 
-        req = urllib.request.Request(
-            self.url, data=payload, method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": "pz-pretzel-ai/1.0",
-                     "x-portkey-trace-id": f"bench-{run_id}-{row['prompt_id']}",
-                     self.gw["api_key_header"]: self.key})
+        headers = {"Content-Type": "application/json", "User-Agent": "pz-pretzel-ai/1.0",
+                   "x-portkey-trace-id": f"bench-{run_id}-{row['prompt_id']}",
+                   self.gw["api_key_header"]: self.key}
 
-        started = time.monotonic()
-        try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
-                status, doc = resp.status, json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
+        # Retry loop. Every attempt is a WHOLE turn — the guardrail scans again and gets a new
+        # scan_id — so what lands in the case is one complete exchange, not a scan from one attempt
+        # stitched to a reply from another. That is also why a retried case is not marked as
+        # special: once it succeeds there is nothing partial about it.
+        status, doc, latency, transport = 0, {}, 0, ""
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            req = urllib.request.Request(self.url, data=payload, method="POST", headers=headers)
+            started = time.monotonic()
+            resp_headers = None
             try:
-                status, doc = exc.code, json.loads(exc.read().decode())
-            except Exception:                       # noqa: BLE001 - a non-JSON error body
-                status, doc = exc.code, {}
-        except Exception as exc:                    # noqa: BLE001 - reported as the case's outcome
-            return {"verdict": "error", "scan_id": "", "detectors": [], "caught": "-",
-                    "response": "", "tool_calls": None, "http_status": 0,
-                    "latency_ms": int((time.monotonic() - started) * 1000),
-                    "raw_request": body, "raw_response": None, "error": str(exc)[:200]}
+                with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+                    status, doc = resp.status, json.loads(resp.read().decode())
+                transport = ""
+            except urllib.error.HTTPError as exc:
+                resp_headers = getattr(exc, "headers", None)
+                try:
+                    status, doc = exc.code, json.loads(exc.read().decode())
+                except Exception:                   # noqa: BLE001 - a non-JSON error body
+                    status, doc = exc.code, {}
+                transport = ""
+            except Exception as exc:                # noqa: BLE001 - reported as the case's outcome
+                status, doc, transport = 0, {}, str(exc)[:200]
+            latency = int((time.monotonic() - started) * 1000)
 
-        latency = int((time.monotonic() - started) * 1000)
+            # A transport failure is retried too: a dropped connection is as much a non-result as a
+            # 429, and the run has nothing to score either way.
+            retryable = status in RETRY_STATUSES or (transport and status == 0)
+            if not retryable or attempt == MAX_ATTEMPTS:
+                if retryable:
+                    log.warning("case %s gave up after %d attempts (status=%s%s)",
+                                row["prompt_id"], attempt, status,
+                                ", " + transport if transport else "")
+                break
+
+            delay = _backoff(attempt, _retry_after(resp_headers, doc))
+            log.info("case %s retrying in %.2fs (attempt %d/%d, status=%s%s)",
+                     row["prompt_id"], delay, attempt, MAX_ATTEMPTS, status,
+                     ", " + transport if transport else "")
+            time.sleep(delay)
+
+        if transport:
+            return {"verdict": "error", "scan_id": "", "detectors": [], "caught": "-",
+                    "response": "", "tool_calls": None, "http_status": 0, "completed": False,
+                    "latency_ms": latency,
+                    "raw_request": body, "raw_response": None, "error": transport}
         scan = extract_scan(doc)
 
         # A soft-denied 200 is a block: the gateway forwarded nothing and said so in the hook. The
@@ -169,9 +277,13 @@ class Caller:
             if isinstance(calls, list) and calls:
                 tool_calls = calls
 
+        # `completed` is "the provider answered", which is exactly the condition under which the
+        # gateway could have run its response-direction hook. Read off `choices` rather than off
+        # the status, because a 200 that carried no completion is the same nothing as a 429.
         return {"verdict": verdict, "scan_id": scan.get("scan_id", ""), "detectors": detectors,
                 "caught": caught, "response": reply, "tool_calls": tool_calls,
                 "http_status": status, "latency_ms": latency,
+                "completed": bool(isinstance(choices, list) and choices),
                 "raw_request": body, "raw_response": doc, "error": ""}
 
 

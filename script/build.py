@@ -53,7 +53,7 @@ def run():
     )
 
     # The grpc plugin emits a flat `import pretzel_ai_pb2`, which resolves only when the stub's own
-    # directory is on sys.path. Nothing puts it there: the daemon runs as `python -m src.grpc.server`
+    # directory is on sys.path. Nothing puts it there: the daemon runs as `python -m src.main`
     # from the repo root, so sys.path carries the root and not src/grpc, and the generated stub
     # fails to import as shipped. Rewriting it to a package import makes it resolve from the root
     # like every other module here, with no sys.path manipulation to arrange or to remember.

@@ -54,7 +54,9 @@ pretzel-ai                       the CLI dispatcher
 script/                          build / install / start / stop / clean
 src/grpc/pretzel_ai.proto        the mgmtd <-> pretzel-ai contract (source of truth,
                                  mirrored into pretzel/mgmtd/grpc/)
-src/grpc/server.py               the gRPC server: Chat + the corpus operations
+src/main.py                      the entry point: args, log level, config, then serve
+src/grpc/serve.py                the gRPC transport: build the server, hold the port
+src/grpc/server.py               the gRPC handlers: Chat + the corpus and benchtest operations
 src/gateway.py                   the AIRS gateway call + scan-verdict extraction
 src/config.py                    loads prisma-airs/config.json → gateway config
 src/log.py                       rotating file log at /var/log/pretzel-ai
