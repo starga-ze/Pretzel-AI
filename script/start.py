@@ -18,7 +18,8 @@ import sys
 import time
 
 from script.utils import (
-    ROOT_DIR, VENV_PY, GRPC_DIR, LOG_DIR, LOG_FILE, SERVICE_NAME, SERVICE_PATH, LISTEN, run_cmd,
+    ENV_DIR, ENV_FILE, ROOT_DIR, VENV_PY, GRPC_DIR, LOG_DIR, LOG_FILE, SERVICE_NAME, SERVICE_PATH,
+    LISTEN, run_cmd,
 )
 
 UNIT_TEMPLATE = """\
@@ -34,6 +35,9 @@ WorkingDirectory={root}
 # on disk records what the running daemon was told. DEBUG makes the daemon dump the text operators
 # typed (see PretzelAiServicer.Chat), which is why it is not the default and not a runtime toggle.
 Environment="PZ_PRETZEL_AI_LOG_LEVEL={log_level}"
+# Keys live here, not in the repo and not in the config document. The leading '-' means a missing
+# file is not an error: an appliance running through the gateway needs nothing in it.
+EnvironmentFile=-{env_file}
 ExecStart={python} -m src.main --listen {listen}
 Restart=always
 RestartSec=3
@@ -44,6 +48,49 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 """
+
+
+ENV_TEMPLATE = """\
+# pretzel-ai keys — root-only, read by the systemd unit as an EnvironmentFile.
+#
+# Every one of these wins over the matching field in config.json (see src/config.py),
+# so a key never has to be written into the config document. Uncomment and fill in the ones this
+# deployment's route actually uses, then `sudo ./pretzel-ai start`.
+#
+# No quotes, no `export`, one per line. Nothing here is read while the daemon is running: the
+# environment is what the unit hands the process at start.
+
+# route.llm = direct — one per provider slug, the part of a model id before the slash
+# (@openai/gpt-4o-… -> PZ_OPENAI_API_KEY). A provider with no key here fails at call time with
+# the provider's own 401, and the daemon warns about it at startup.
+#PZ_OPENAI_API_KEY=
+#PZ_ANTHROPIC_API_KEY=
+#PZ_GOOGLE_API_KEY=
+
+# route.llm = gateway — the gateway subscription key.
+#PZ_PORTKEY_API_KEY=
+
+# route.guardrail = airs — the Prisma AIRS scan API key.
+#PANW_AI_SEC_API_KEY=
+"""
+
+
+def _ensure_env_file():
+    """Create the key file if it is not there, and never touch it if it is.
+
+    Written once, 0600 root: an operator who put a key in it means it, and a "helpful" rewrite on
+    the next start would be indistinguishable from the key not working.
+    """
+    if os.path.exists(ENV_FILE):
+        print(f"[*] Keys: {ENV_FILE} (left as it is)")
+        return
+    os.makedirs(ENV_DIR, mode=0o700, exist_ok=True)
+    # Created 0600 from the start rather than written and then chmod'ed — the window between the
+    # two is when a world-readable file holds a key.
+    fd = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(ENV_TEMPLATE)
+    print(f"[*] Wrote {ENV_FILE} — fill in the keys this route needs")
 
 
 def _wait_until_serving(timeout_sec=15):
@@ -107,8 +154,10 @@ def run():
     if level == "debug":
         print("[!] log level DEBUG: the daemon will dump the text operators type")
 
+    _ensure_env_file()
+
     unit = UNIT_TEMPLATE.format(root=ROOT_DIR, python=VENV_PY, listen=LISTEN, log_file=LOG_FILE,
-                                log_level=level)
+                                log_level=level, env_file=ENV_FILE)
     with open(SERVICE_PATH, "w") as f:
         f.write(unit)
     print(f"[*] Wrote {SERVICE_PATH}")

@@ -13,7 +13,7 @@ service PretzelAi {
   // gateway_service.extract_scan for the shape those fields will take).
   rpc Chat(ChatRequest) returns (stream ChatChunk);
 
-  // Which models this appliance may ask for. Answered from prisma-airs/config.json, which is the
+  // Which models this appliance may ask for. Answered from the config this daemon loaded, which is the
   // one place that knows — the gateway account decides what is reachable, so this is a fact about
   // the daemon and not a declaration the operator makes. That is why it comes back over the wire
   // instead of riding in running_config: a catalog committed there would be diffed and rolled back
@@ -326,6 +326,7 @@ message BenchmarkSummary {
   repeated BenchmarkBucket    by_verdict  = 3;
   repeated BenchmarkBucket    by_language = 4;
   repeated BenchmarkTechnique techniques  = 5;
+  repeated BenchmarkBucket    by_checkpoint = 7;
   string error = 6;
 }
 
@@ -337,7 +338,7 @@ message ListBenchmarkRequest {
   string verdict   = 3;
   string language  = 4;
   string technique = 5;
-  string search    = 6;   // substring over prompt text and prompt id
+  string search    = 6;   // substring over the contents text and the prompt id
   int32  offset    = 7;
   int32  limit     = 8;   // server-capped
 
@@ -345,26 +346,42 @@ message ListBenchmarkRequest {
   // than refused — an ordering the server does not know is not a reason to withhold the table.
   string order_by   = 9;
   bool   descending = 10;
+  string checkpoint = 11;
 }
 
 // One prompt, as the uploaded file carried it. `extra` is whatever fields the file had that the
 // schema has no column for, as a JSON object — kept so the stored set is not a lossy copy.
+// 데이터셋 v2. 행 하나가 곧 AIRS 스캔 요청 1회이며, 판정 대상은 프롬프트 문자열이 아니라
+// `contents_json`이 담은 요청 본문 배열이다.
+//
+// 5·8·11·12·13·14 는 v1 필드(category_en / scan_target / expected_labels / severity / origin /
+// prompt)가 쓰던 번호다. proto3에서 지운 번호를 다시 쓰면 구버전 바이너리가 새 필드를 옛 타입으로
+// 읽으므로 reserved 로 막아 둔다 — 콘솔과 서버가 같은 배포에서만 도는 보장이 없다.
 message BenchmarkRow {
+  reserved 5, 8, 11, 12, 13, 14;
+  reserved "category_en", "scan_target", "expected_labels", "severity", "origin", "prompt";
+
   int32  row_no          = 1;   // position in the file, 1-based
   string prompt_id       = 2;
   string category        = 3;
   string category_ko     = 4;
-  string category_en     = 5;
-  string verdict         = 6;   // malicious | benign
-  string expected        = 7;   // block | allow
-  string scan_target     = 8;   // prompt | response | tool
+  string verdict         = 6;   // malicious | benign — 이 행이 위협인가
+  // block | allow — 이 행에 기대하는 처분. `verdict`(위협 여부)와 다른 축이라 이름을 갈랐다.
+  string expected_action = 7;
   string language        = 9;   // mix | ko | en
   string technique       = 10;
-  repeated string expected_labels = 11;
-  string severity        = 12;
-  string origin          = 13;
-  string prompt          = 14;
   string extra_json      = 15;
+
+  // prompt | response | response + context | tool_event (input) | tool_event (output)
+  string checkpoint      = 16;
+  // `블록.디텍터` 표기. prompt.injection, tool_output.dlp 처럼 어느 블록에서 떠야 하는지까지 담는다
+  // — 같은 이름의 디텍터가 블록마다 있고, response 에는 injection 이 아예 없다.
+  repeated string expected_detector = 17;
+  // AIRS 요청의 contents 배열을 JSON 문자열 그대로. 구조를 proto 메시지로 옮기지 않는 이유는
+  // 벤더 스키마가 바뀔 때 이 파일까지 따라 바뀌게 하지 않기 위해서다.
+  string contents_json   = 18;
+  // 알려진 한계를 일부러 남긴 행의 설명. 빈 문자열이면 그런 행이 아니다.
+  string note            = 19;
 }
 
 message BenchmarkPage {
@@ -406,19 +423,37 @@ message RunBenchtestRequest {
 // — they are in the database, and streaming them per case would push megabytes through a window
 // that shows one line each.
 message RunCase {
+  reserved 13;
+  reserved "prompt";
+
   int32  seq        = 1;
   string prompt_id  = 2;
   string category   = 3;
   string technique  = 4;
   string language   = 5;
-  string expected   = 6;   // block | allow
-  string verdict    = 7;   // what the gateway did
-  repeated string detectors = 8;
-  string cause      = 9;   // the scored outcome
+  // 기대값과 관측치를 같은 접두사로 짝짓는다. `actual`이 아니라 `observed`인 이유: 정답은
+  // 우리가 붙인 라벨이고 AIRS의 답은 그 정답에 대고 재는 관측치다 — `actual`은 그 방향을
+  // 거꾸로 말한다.
+  string expected_action = 6;   // block | allow
+  string observed_action = 7;   // AIRS 가 답한 action
+  repeated string observed_detector = 8;   // 실제로 발화한 것
+  string cause      = 9;
   bool   ok         = 10;
   bool   excluded   = 11;  // ok is not meaningful: uninspected, or the call failed
   int32  latency_ms = 12;
-  string prompt     = 13;   // joined from the set, so a run lists the way the set does
+
+  string checkpoint = 14;
+  repeated string expected_detector = 15;
+  // hit | misclassified | miss | false_positive | clean_pass
+  //
+  // `ok` 불리언으로는 '차단됐지만 기대 디텍터는 안 뜬' 경우를 표현할 수 없다. 스캔 1회가 모든
+  // 디텍터를 돌리기 때문에 그 구분이 곧 실질 커버리지이고, v1 에서 헤드라인 차단율이 실제 성능을
+  // 가렸던 자리가 정확히 여기다.
+  string outcome    = 16;
+  repeated string threats = 17;
+  // 세트에서 조인해 온 값. 알려진 한계를 일부러 남긴 케이스를 결과 화면에서 골라내려면
+  // 목록 단계에서 이미 보여야 한다.
+  string note       = 18;
 }
 
 message RunTally {
@@ -474,6 +509,7 @@ message GetBenchtestRunRequest {
   string language  = 4;
   string technique = 5;
   string search    = 6;
+  string checkpoint = 7;
 }
 
 message BenchtestRunSummary {
@@ -483,6 +519,9 @@ message BenchtestRunSummary {
   repeated BenchmarkBucket by_category  = 7;
   repeated BenchmarkBucket by_verdict   = 8;
   repeated BenchmarkBucket by_language  = 9;
+  // v2 의 정의축. 같은 위협이 어느 검사 시점에서 잡히고 놓치는지가 이 칩으로 갈린다 —
+  // 대분류만으로는 21조합이 10칸으로 뭉개져 커버리지 구멍이 보이지 않는다.
+  repeated BenchmarkBucket by_checkpoint = 11;
   repeated BenchmarkTechnique techniques = 10;
   // The two rates the report needs, and the gap between them is the point: attacks the model
   // itself refused never produced anything for the profile to scan.
@@ -505,6 +544,7 @@ message ListBenchtestCasesRequest {
   string search    = 9;
   string order_by   = 10;  // "seq" (the run's order, the default) or "prompt_id"
   bool   descending = 11;
+  string checkpoint = 12;
 }
 
 message BenchtestCaseList {
@@ -525,11 +565,14 @@ message GetBenchtestCaseRequest {
 // travelled in. Showing the prompt beside the raw request is the point — a disputed verdict is
 // settled by seeing that what went out was what was meant to go out.
 message BenchtestCaseDetail {
+  reserved 5;
+  reserved "prompt";
+
   RunCase summary      = 1;
   string  scan_id      = 2;
   string  caught       = 3;
   int32   http_status  = 4;
-  string  prompt       = 5;   // Request (prompt): the set's prompt for this case
+  string  contents_json = 11;  // Request: 세트가 이 케이스에 대해 보내기로 한 contents 배열
   string  response     = 6;   // Response: the model's text
   string  raw_request  = 7;   // Raw request: the whole request that was sent
   string  raw_response = 8;   // Raw response: the whole document that came back

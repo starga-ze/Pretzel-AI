@@ -2,6 +2,11 @@
 """Client and server classes corresponding to protobuf-defined services."""
 import grpc
 
+# HAND PATCH — reapply after every `grpc_tools.protoc` run.
+# protoc writes a top-level `import pretzel_ai_pb2`, but these generated files live inside the
+# `src.grpc` package. Leave protoc's version in place and the daemon dies at startup with
+# ModuleNotFoundError: No module named 'pretzel_ai_pb2' — and systemd's restart loop makes it
+# look like a config problem rather than an import one.
 from src.grpc import pretzel_ai_pb2 as pretzel__ai__pb2
 
 
@@ -124,7 +129,7 @@ class PretzelAiServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def ListModels(self, request, context):
-        """Which models this appliance may ask for. Answered from prisma-airs/config.json, which is the
+        """Which models this appliance may ask for. Answered from the config this daemon loaded, which is the
         one place that knows — the gateway account decides what is reachable, so this is a fact about
         the daemon and not a declaration the operator makes. That is why it comes back over the wire
         instead of riding in running_config: a catalog committed there would be diffed and rolled back

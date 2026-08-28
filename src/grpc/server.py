@@ -37,6 +37,8 @@ class PretzelAiServicer(
     UNIMPLEMENTED rather than AttributeError.
     """
 
-    def __init__(self, gateway):
-        # Only the chat handlers need it; it lives here because construction is this file's job.
-        self._gateway = gateway
+    def __init__(self, engine):
+        # The engine already holds the transport and the guardrail that config selected. Handlers
+        # take it as given: none of them may ask which route this appliance is running, because a
+        # handler that branched on it would be a second place the matrix is decided.
+        self._engine = engine

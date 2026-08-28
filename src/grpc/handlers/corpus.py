@@ -10,6 +10,12 @@ from src.grpc import pretzel_ai_pb2
 
 log = logging.getLogger("pretzel-ai")
 
+# One refresh at a time. The crawl saturates the network worker pool and writes the whole
+# techdoc schema; two interleaved would double-fetch every page and race each other's writes
+# for no gain. A second caller is refused rather than queued, because the console's card is a
+# synchronous window and a request that silently waited would look like one that had hung.
+_refresh_lock = threading.Lock()
+
 
 def _list_documents(servicer, request, context):
     """Shared by the RPC below; kept apart so the error shape is written once."""

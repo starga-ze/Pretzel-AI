@@ -14,9 +14,16 @@ anyway. Scanning the finished answer and then re-streaming it is the honest comp
 import json
 import logging
 
+from src.chat.console import to_document
 from src.grpc import pretzel_ai_pb2
+from src.guardrail import Turn
+from src.llm.transport import Message, Role
 
 log = logging.getLogger("pretzel-ai")
+
+# Values in the request dump are capped; fields never are. A 32 KiB turn would otherwise bury
+# the surrounding log, and the cut is marked so a truncated value is never read as the whole.
+_DUMP_CAP = 2048
 
 
 # How the completed reply is sliced into deltas for the console. Whitespace-preserving so the
@@ -82,27 +89,50 @@ class ChatHandlers:
         # decision to read employee text, so it takes a decision to switch on.
         log.debug("%s", dump_chat_request(request))
 
-        history = [{"role": t.role, "content": t.content} for t in request.history]
-        result = self._gateway.complete_turn(
-            request.model, request.message, request.system_prompt or None,
-            history, request.session_id, request.transaction_id)
+        # An unknown role is dropped rather than coerced to "user": a mislabelled assistant turn
+        # replayed as the person's own words rewrites what the model believes it already said.
+        history = [Message(role=Role(t.role), content=t.content)
+                   for t in request.history
+                   if t.role in ("user", "assistant") and t.content]
 
-        # Stream the reply text (only present on a successful turn) so the console fills in as it
-        # arrives; a failed turn streams nothing and carries its reason on the final chunk.
-        if result.get("ok") and isinstance(result.get("reply"), str):
-            for piece in _chunks(result["reply"]):
+        # The three ids the appliance traces a scan by. tr_id is NOT set here — the engine mints
+        # one per model call, and with tools there is more than one of those in a single request.
+        turn = Turn(session_id=request.session_id,
+                    transaction_id=request.transaction_id,
+                    app_user=_peer_user(context))
+
+        # Where this actually goes — gateway or straight to the provider, inspected by AIRS or by
+        # the gateway's inline hook or by nothing — was decided once at startup, in
+        # factory.build_engine. This handler cannot tell and must not try: a branch here would be
+        # a second place the deployment matrix is decided, and the two would drift.
+        result = self._engine.run(
+            request.message,
+            model=request.model,
+            system_prompt=request.system_prompt or None,
+            history=history,
+            turn=turn)
+
+        document = to_document(result)
+
+        # Stream the reply text (only on a successful turn) so the console fills in as it arrives.
+        # It is a FINISHED answer being re-streamed, not tokens proxied from the model: the
+        # response-side checkpoint has to see the whole thing before any of it is shown, so there
+        # is nothing to stream until there is everything.
+        if result.ok and result.reply:
+            for piece in _chunks(result.reply):
                 yield pretzel_ai_pb2.ChatChunk(delta=piece, done=False)
 
         yield pretzel_ai_pb2.ChatChunk(
             done=True,
-            error="" if result.get("ok") else result.get("error", ""),
-            result_json=json.dumps(result, ensure_ascii=False),
+            error="" if result.ok else result.error,
+            result_json=json.dumps(document, ensure_ascii=False),
         )
 
     def ListModels(self, request, context):
         """The picker's catalog. Unary and cheap — it is read once per page load."""
         try:
-            models = self._gateway.catalog()
+            catalog = self._engine.catalog
+            models = catalog.as_list()
         except Exception as exc:                    # noqa: BLE001 - reported to the console
             log.exception("ListModels failed")
             return pretzel_ai_pb2.ModelList(error=str(exc))
@@ -110,4 +140,15 @@ class ChatHandlers:
         log.debug("ListModels from %s: %d models", context.peer(), len(models))
         return pretzel_ai_pb2.ModelList(
             models=[pretzel_ai_pb2.Model(**m) for m in models],
-            default_model=self._gateway.default_model)
+            default_model=catalog.default)
+
+
+def _peer_user(context) -> str:
+    """Who to file this scan under.
+
+    mgmtd does not forward the signed-in operator today, so the peer address is the closest thing
+    to an identity available here. Named as its own function because the day mgmtd does send a
+    username, this is the one line that changes — and until then the scan logs should say plainly
+    that the appliance, not a person, is what they identified.
+    """
+    return context.peer() or "pretzel-ai"

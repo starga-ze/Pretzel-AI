@@ -24,20 +24,16 @@ open for it. The caller stops iterating to cancel, which is also how the crawl i
 
 import json
 import logging
-import random
-import re
-import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from src import config as pa_config
 from src.benchmark import store
-from src.gateway import extract_scan
+from src.benchmark.caller import EngineCaller
+from src.factory import build_engine
 
 log = logging.getLogger("pretzel-ai.benchmark.runner")
 
-CONFIG_PATH = "/home/jinho/pretzel-ai/prisma-airs/config.json"
+CONFIG_PATH = "/home/jinho/pretzel-ai/config.json"
 
 # The detector each category exists to exercise. A hit from anything else is a block on the wrong
 # grounds and is counted separately from a clean one.
@@ -58,69 +54,15 @@ DEFAULT_WORKERS = 8
 MAX_WORKERS = 16
 TIMEOUT_SEC = 60
 
-# Statuses worth trying again. 429 is the one that matters in practice — the provider's tokens-per
-# -minute ceiling, which a 1,500-prompt run across 8 workers walks straight into — but a 5xx from
-# the gateway or the provider is the same kind of nothing: the turn did not happen, and the case
-# has no result either way. 4xx that are not 429 are the request being wrong, and repeating a wrong
-# request is just a slower way to be wrong.
-RETRY_STATUSES = frozenset((408, 429, 500, 502, 503, 504))
-
-# Four attempts, not more. A run is thousands of calls and every retry costs a fresh AIRS scan as
-# well as a provider call; past this the honest answer is that the appliance is over its quota and
-# the run should be slowed down, not hammered harder.
-MAX_ATTEMPTS = 4
-BACKOFF_BASE_SEC = 0.6
-BACKOFF_CAP_SEC = 12.0
-
-# "Please try again in 162ms" / "in 1.5s" — OpenAI puts the exact figure in the error text, which
-# is better than any backoff we could guess. Read when there is no Retry-After header.
-_RETRY_HINT = re.compile(r"try again in\s+([0-9.]+)\s*(ms|s)\b", re.I)
-
-
-def _retry_after(headers, doc):
-    """How long the provider asked us to wait, in seconds, or None if it did not say."""
-    raw = ""
-    if headers:
-        try:
-            raw = headers.get("Retry-After") or headers.get("retry-after") or ""
-        except Exception:                           # noqa: BLE001 - odd header container
-            raw = ""
-    if raw:
-        try:
-            return max(0.0, float(raw))             # seconds form; the HTTP-date form is not used here
-        except ValueError:
-            pass
-
-    message = ""
-    if isinstance(doc, dict):
-        err = doc.get("error")
-        if isinstance(err, dict):
-            message = err.get("message", "") or ""
-        elif isinstance(err, str):
-            message = err
-    hit = _RETRY_HINT.search(message)
-    if hit:
-        value = float(hit.group(1))
-        return value / 1000.0 if hit.group(2).lower() == "ms" else value
-    return None
-
-
-def _backoff(attempt, asked):
-    """Seconds to sleep before `attempt` (1-based). The provider's own figure wins.
-
-    Jitter is not decoration here: eight workers rate-limited by the same bucket in the same second
-    would otherwise wake in the same second and collide again, turning one stall into a rhythm.
-    """
-    if asked is not None:
-        base = asked
-    else:
-        base = BACKOFF_BASE_SEC * (2 ** (attempt - 1))
-    return min(BACKOFF_CAP_SEC, base) * (1.0 + random.random() * 0.25)
-
-
 def _refused(reply):
+    """Whether the model declined, rather than answered.
+
+    Only the head of the reply is searched: a compliant answer can say something inappropriate
+    halfway through without that being a refusal, and a marker found there would misread the whole
+    turn.
+    """
     head = (reply or "")[:REFUSAL_HEAD].lower()
-    return any(m in head for m in REFUSAL_MARKERS)
+    return any(marker in head for marker in REFUSAL_MARKERS)
 
 
 def classify(row, res):
@@ -173,120 +115,6 @@ def classify(row, res):
     return True, "정상통과"
 
 
-class Caller:
-    """One gateway call per prompt, each with its own trace id so AIRS files it as its own session.
-
-    The request and the whole response document are kept: a disputed verdict is settled by what was
-    actually sent and what actually came back, not by a summary of them.
-    """
-
-    def __init__(self, config_path=CONFIG_PATH):
-        gw, creds = pa_config.load(config_path)
-        self.gw = gw
-        self._models = {m["id"]: m for m in gw.get("models", [])}
-        self.key = creds.key("portkey")
-        self.url = f"https://{gw['host']}{gw['path']}"
-        self.model = gw.get("default_model", "")
-
-    def __call__(self, case):
-        row, run_id = case
-        # Same per-model output-cap name as the chat path (see gateway.complete): the gpt-5
-        # generation 400s on `max_tokens`. A run that 400ed every prompt would score as a run
-        # where the guardrail caught nothing, so this is not cosmetic here.
-        token_param = (self._models.get(self.model) or {}).get("token_param", "max_tokens")
-        body = {"model": self.model,
-                token_param: self.gw.get("max_tokens", 256), "stream": False,
-                "messages": [{"role": "user", "content": row["prompt"]}]}
-        # Agent rows declare the toolset, because Agent Protection inspects the agent surface and
-        # a plain completion carries none of it.
-        payload = json.dumps(body).encode()
-
-        headers = {"Content-Type": "application/json", "User-Agent": "pz-pretzel-ai/1.0",
-                   "x-portkey-trace-id": f"bench-{run_id}-{row['prompt_id']}",
-                   self.gw["api_key_header"]: self.key}
-
-        # Retry loop. Every attempt is a WHOLE turn — the guardrail scans again and gets a new
-        # scan_id — so what lands in the case is one complete exchange, not a scan from one attempt
-        # stitched to a reply from another. That is also why a retried case is not marked as
-        # special: once it succeeds there is nothing partial about it.
-        status, doc, latency, transport = 0, {}, 0, ""
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            req = urllib.request.Request(self.url, data=payload, method="POST", headers=headers)
-            started = time.monotonic()
-            resp_headers = None
-            try:
-                with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
-                    status, doc = resp.status, json.loads(resp.read().decode())
-                transport = ""
-            except urllib.error.HTTPError as exc:
-                resp_headers = getattr(exc, "headers", None)
-                try:
-                    status, doc = exc.code, json.loads(exc.read().decode())
-                except Exception:                   # noqa: BLE001 - a non-JSON error body
-                    status, doc = exc.code, {}
-                transport = ""
-            except Exception as exc:                # noqa: BLE001 - reported as the case's outcome
-                status, doc, transport = 0, {}, str(exc)[:200]
-            latency = int((time.monotonic() - started) * 1000)
-
-            # A transport failure is retried too: a dropped connection is as much a non-result as a
-            # 429, and the run has nothing to score either way.
-            retryable = status in RETRY_STATUSES or (transport and status == 0)
-            if not retryable or attempt == MAX_ATTEMPTS:
-                if retryable:
-                    log.warning("case %s gave up after %d attempts (status=%s%s)",
-                                row["prompt_id"], attempt, status,
-                                ", " + transport if transport else "")
-                break
-
-            delay = _backoff(attempt, _retry_after(resp_headers, doc))
-            log.info("case %s retrying in %.2fs (attempt %d/%d, status=%s%s)",
-                     row["prompt_id"], delay, attempt, MAX_ATTEMPTS, status,
-                     ", " + transport if transport else "")
-            time.sleep(delay)
-
-        if transport:
-            return {"verdict": "error", "scan_id": "", "detectors": [], "caught": "-",
-                    "response": "", "tool_calls": None, "http_status": 0, "completed": False,
-                    "latency_ms": latency,
-                    "raw_request": body, "raw_response": None, "error": transport}
-        scan = extract_scan(doc)
-
-        # A soft-denied 200 is a block: the gateway forwarded nothing and said so in the hook. The
-        # two must not read differently, or enforcement looks like it is off when it is on.
-        hooks = (doc.get("hook_results") or {}).get("before_request_hooks") or []
-        soft = any(h.get("softDeny200") for h in hooks if isinstance(h, dict))
-        verdict = scan.get("verdict", "allow")
-        if status == 446 or soft:
-            verdict = "block"
-
-        hits = [(h["id"], h["direction"]) for h in scan.get("categories", []) if h.get("hit")]
-        detectors = sorted({d for d, _ in hits})
-        directions = {d for _, d in hits}
-        caught = ("요청+응답" if len(directions) > 1
-                  else "요청" if directions == {"prompt"}
-                  else "응답" if directions == {"response"} else "-")
-
-        reply, tool_calls = "", None
-        choices = doc.get("choices") if isinstance(doc, dict) else None
-        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-            message = choices[0].get("message") or {}
-            if isinstance(message.get("content"), str):
-                reply = message["content"]
-            calls = message.get("tool_calls")
-            if isinstance(calls, list) and calls:
-                tool_calls = calls
-
-        # `completed` is "the provider answered", which is exactly the condition under which the
-        # gateway could have run its response-direction hook. Read off `choices` rather than off
-        # the status, because a 200 that carried no completion is the same nothing as a 429.
-        return {"verdict": verdict, "scan_id": scan.get("scan_id", ""), "detectors": detectors,
-                "caught": caught, "response": reply, "tool_calls": tool_calls,
-                "http_status": status, "latency_ms": latency,
-                "completed": bool(isinstance(choices, list) and choices),
-                "raw_request": body, "raw_response": doc, "error": ""}
-
-
 def run(conn, dataset_id, filters=None, search="", workers=DEFAULT_WORKERS,
         label="", note="", config_path=CONFIG_PATH):
     """Execute a run and yield progress. The last thing yielded has final=True.
@@ -294,6 +122,19 @@ def run(conn, dataset_id, filters=None, search="", workers=DEFAULT_WORKERS,
     The caller cancels by not asking for the next item; the run is then marked cancelled with the
     cases it managed to complete, which is why `selected` is stored separately from their count.
     """
+    # 데이터셋 v2의 실행 경로는 아직 없다. v1 러너는 행의 `prompt` 한 줄을 엔진에 태워 모델을
+    # 부르고 그 왕복을 채점했는데, v2는 행이 곧 AIRS 요청(`contents`)이라 모델을 부르지 않고
+    # scan API에 그대로 POST해야 한다. 채점 축도 다르다 — 기대 디텍터가 `블록.디텍터`로 한정되고
+    # 결과가 다섯 갈래다.
+    #
+    # 그래서 v1 코드를 그대로 두면 첫 행에서 KeyError('prompt')로 죽거나, 더 나쁘게는 엉뚱한 것을
+    # 재고 그 숫자를 리포트에 싣게 된다. 지금은 **분명한 문장으로 거절**하고, CLI(dataset/
+    # run_bench_v2.py)로 돌린 뒤 dataset/load_run_v2.py 로 적재한다.
+    yield {"stage": "failed", "done": 0, "total": 0, "final": True,
+           "error": "데이터셋 v2의 실행 경로는 아직 구현되지 않았습니다. "
+                    "dataset/run_bench_v2.py 로 실행한 뒤 dataset/load_run_v2.py 로 적재하세요."}
+    return
+
     workers = max(1, min(int(workers or DEFAULT_WORKERS), MAX_WORKERS))
 
     # The whole scope up front, not page by page: the set has to be fixed before the first call, or
@@ -306,11 +147,17 @@ def run(conn, dataset_id, filters=None, search="", workers=DEFAULT_WORKERS,
         return
 
     try:
-        caller = Caller(config_path)
+        config, credentials = pa_config.load(config_path)
+        caller = EngineCaller(build_engine(config, credentials))
     except Exception as exc:                        # noqa: BLE001 - reported to the console
         yield {"stage": "failed", "done": 0, "total": len(rows), "final": True,
-               "error": f"gateway configuration unusable: {exc}"}
+               "error": f"configuration unusable: {exc}"}
         return
+
+    # Which route this run measured. Recorded in the log because a result read next week means
+    # nothing without it: the same set through the gateway and through the scan API answers
+    # different questions.
+    log.info("benchtest run over %s", caller.describes)
 
     filters = filters or {}
     with conn.cursor() as cur:
@@ -433,8 +280,8 @@ def run_summary(conn, run_id, filters=None, search=""):
         if not got:
             return None
         out = _run_row(got)
-        cur.execute("SELECT cause, count(*) FROM benchmark.run_case WHERE run_id = %s "
-                    "GROUP BY cause ORDER BY count(*) DESC", (run_id,))
+        cur.execute("SELECT outcome, count(*) FROM benchmark.run_case WHERE run_id = %s "
+                    "AND outcome <> '' GROUP BY outcome ORDER BY count(*) DESC", (run_id,))
         out["tally"] = [{"key": c, "count": n} for c, n in cur.fetchall()]
         # The scope breakdowns the Result filters are drawn from — of the cases this run actually
         # holds, not of the set: a chip offering a category the run never covered is a dead end.
@@ -447,15 +294,17 @@ def run_summary(conn, run_id, filters=None, search=""):
                 f"WHERE rc.run_id = %s AND r.{field} <> '' "
                 f"GROUP BY r.{field} ORDER BY r.{field}", (run_id,))
             out["by_" + field] = [{"key": k, "count": n} for k, n in cur.fetchall()]
-        # The two rates, and the difference between them is the story: attacks the model itself
-        # refused never produced anything for the profile to scan.
+        # v2에서는 모델을 부르지 않는다 — contents를 AIRS에 그대로 POST하므로 "모델이 거부해서
+        # 검사할 것이 없었다"는 상태가 생기지 않는다. v1에서 미탐의 89%를 차지하던 그 항목이
+        # 사라진 자리라, 보정 전/후 두 비율도 하나로 합쳐진다.
         where, params = ["rc.run_id = %s", "r.verdict = 'malicious'"], [run_id]
         for key, value in (filters or {}).items():
             if key in CASE_FILTERS and value and key != "verdict":
-                where.append(f"r.{key} = %s")
+                prefix = "rc" if key in CASE_OWN_FILTERS else "r"
+                where.append(f"{prefix}.{key} = %s")
                 params.append(value)
         if search:
-            where.append("(r.prompt ILIKE %s OR rc.prompt_id ILIKE %s)")
+            where.append("(r.contents::text ILIKE %s OR rc.prompt_id ILIKE %s)")
             params += [f"%{search}%", f"%{search}%"]
         # A verdict filter of "benign" leaves no attacks, and the rates correctly read as "—".
         if (filters or {}).get("verdict") == "benign":
@@ -463,7 +312,7 @@ def run_summary(conn, run_id, filters=None, search=""):
 
         cur.execute(
             "SELECT count(*) FILTER (WHERE rc.ok), count(*) FILTER (WHERE rc.ok IS NOT NULL), "
-            "       count(*) FILTER (WHERE rc.cause = '미탐(모델거부)') "
+            "       0 "
             "FROM benchmark.run_case rc "
             "JOIN benchmark.run run ON run.id = rc.run_id "
             "LEFT JOIN benchmark.row r ON r.dataset_id = run.dataset_id "
@@ -476,21 +325,26 @@ def run_summary(conn, run_id, filters=None, search=""):
     return out
 
 
-CASE_COLUMNS = ("seq", "prompt_id", "row_no", "expected", "verdict", "cause", "ok", "scan_id",
-                "detectors", "caught", "http_status", "latency_ms", "response")
+CASE_COLUMNS = ("seq", "prompt_id", "row_no", "expected_action", "observed_action", "cause",
+                "ok", "scan_id", "observed_detector", "expected_detector", "checkpoint",
+                "outcome", "threats", "caught", "http_status", "latency_ms", "response")
 
 # The set's own columns, joined back on so a run's cases list the way the set does. run_case does
 # not copy them — duplicating a prompt's category onto every result it ever produces would be a
 # second copy to keep in step — so the join is where the two meet.
-CASE_JOIN_COLUMNS = ("category", "technique", "language", "prompt")
+CASE_JOIN_COLUMNS = ("category", "category_ko", "technique", "language", "note")
 
 
 # Columns of the set a run's cases can be narrowed by, on top of the outcome. The same four the
 # Test tab filters on: a reader who found something odd there asks the same question here.
-CASE_FILTERS = ("category", "verdict", "language", "technique")
+CASE_FILTERS = ("category", "verdict", "language", "technique", "checkpoint")
 
 
 CASE_ORDERS = {"seq": "rc.seq", "prompt_id": "rc.prompt_id"}
+
+# 필터 이름이 run_case에 있는 것과 세트(row)에 있는 것으로 갈린다. checkpoint는 두 곳 다 있는데
+# 케이스 쪽이 실행 당시의 사실이므로 그쪽을 본다.
+CASE_OWN_FILTERS = ("checkpoint",)
 
 
 def cases(conn, run_id, cause="", filters=None, search="", offset=0, limit=store.DEFAULT_LIMIT,
@@ -503,14 +357,17 @@ def cases(conn, run_id, cause="", filters=None, search="", offset=0, limit=store
     """
     where, params = ["rc.run_id = %s"], [run_id]
     if cause:
-        where.append("rc.cause = %s")
-        params.append(cause)
+        # 콘솔이 보내는 값은 outcome 코드(hit / miss / …)다. 예전 한글 cause 값으로 저장된 행이
+        # 섞여 있을 수 있어 둘 다 받는다 — 한쪽만 보면 오래된 실행이 통째로 안 보인다.
+        where.append("(rc.outcome = %s OR rc.cause = %s)")
+        params += [cause, cause]
     for key, value in (filters or {}).items():
         if key in CASE_FILTERS and value:
-            where.append(f"r.{key} = %s")
+            prefix = "rc" if key in CASE_OWN_FILTERS else "r"
+            where.append(f"{prefix}.{key} = %s")
             params.append(value)
     if search:
-        where.append("(r.prompt ILIKE %s OR rc.prompt_id ILIKE %s)")
+        where.append("(r.contents::text ILIKE %s OR rc.prompt_id ILIKE %s)")
         params += [f"%{search}%", f"%{search}%"]
 
     clause = " WHERE " + " AND ".join(where)
@@ -538,13 +395,12 @@ def case_detail(conn, run_id, seq):
     """One case with the whole exchange. Separate from the listing because these are the megabytes
     — nothing wants them until an operator opens a specific case and asks what happened.
 
-    The prompt is joined from the set rather than read out of `raw_request`: it is what was meant
-    to be sent, and comparing it against what the envelope actually carried is the point of showing
-    both."""
+    `contents`는 raw_request에서 파싱하지 않고 세트에서 조인한다 — 나가야 했던 것과 실제로 나간
+    것을 나란히 두어야 판정 이의를 가릴 수 있다."""
     with conn.cursor() as cur:
         cur.execute("SELECT " + ", ".join("rc." + c for c in CASE_COLUMNS)
                     + ", rc.raw_request, rc.raw_response, rc.tool_calls, "
-                      "       r.category, r.technique, r.language, r.prompt "
+                      "       r.category, r.technique, r.language, r.note, r.contents "
                       "FROM benchmark.run_case rc "
                       "JOIN benchmark.run run ON run.id = rc.run_id "
                       "LEFT JOIN benchmark.row r ON r.dataset_id = run.dataset_id "
@@ -559,5 +415,7 @@ def case_detail(conn, run_id, seq):
     out["raw_response"] = json.dumps(got[n + 1], ensure_ascii=False) if got[n + 1] else ""
     out["tool_calls"] = json.dumps(got[n + 2], ensure_ascii=False) if got[n + 2] else ""
     out["category"], out["technique"] = got[n + 3] or "", got[n + 4] or ""
-    out["language"], out["prompt"] = got[n + 5] or "", got[n + 6] or ""
+    out["language"] = got[n + 5] or ""
+    out["note"] = got[n + 6] or ""
+    out["contents_json"] = json.dumps(got[n + 7], ensure_ascii=False) if got[n + 7] else ""
     return out

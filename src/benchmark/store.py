@@ -25,26 +25,25 @@ log = logging.getLogger("pretzel-ai.benchmark.store")
 
 # Columns of benchmark.row that come from the file, in insert order. `prompt_id` is the file's
 # "id"; the rename is deliberate — `id` on a child table reads like its own key.
-ROW_COLUMNS = ("row_no", "prompt_id", "category", "category_ko", "category_en", "verdict",
-               "expected", "scan_target", "language", "technique", "expected_labels",
-               "severity", "origin", "prompt", "extra")
+ROW_COLUMNS = ("row_no", "prompt_id", "category", "category_ko", "verdict", "expected_action",
+               "checkpoint", "language", "technique", "expected_detector", "note",
+               "contents", "extra")
 
 # The file's field names, mapped to the column that holds them. Anything outside this map lands in
 # `extra` rather than being dropped.
 FIELD_TO_COLUMN = {
     "id": "prompt_id", "category": "category", "category_ko": "category_ko",
-    "category_en": "category_en", "verdict": "verdict", "expected": "expected",
-    "scan_target": "scan_target", "language": "language", "technique": "technique",
-    "expected_labels": "expected_labels", "severity": "severity", "origin": "origin",
-    "prompt": "prompt",
+    "verdict": "verdict", "expected_action": "expected_action", "checkpoint": "checkpoint",
+    "language": "language", "technique": "technique",
+    "expected_detector": "expected_detector", "contents": "contents", "note": "note",
 }
 
-TEXT_COLUMNS = ("category", "category_ko", "category_en", "verdict", "expected",
-                "scan_target", "language", "technique", "severity", "origin")
+TEXT_COLUMNS = ("category", "category_ko", "verdict", "expected_action", "checkpoint",
+                "language", "technique", "note")
 
 # What the console may filter a listing by. Interpolated into the WHERE clause, so the legal set is
 # closed here; the values themselves stay parameterised.
-FILTERS = ("category", "verdict", "language", "technique", "scan_target", "severity")
+FILTERS = ("category", "verdict", "language", "technique", "checkpoint")
 
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 50
@@ -54,7 +53,9 @@ DEFAULT_LIMIT = 50
 # memory.
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 MAX_ROWS = 100_000
-MAX_PROMPT_CHARS = 200_000
+# 판정 대상 한 건의 상한. AIRS 자체 한도는 요청 본문 총량 ~2 MiB이고 초과하면 재시도 불가한
+# 413이 온다. 저장 단계에서 걸러 두면 그 실패를 실행 중이 아니라 업로드 때 만난다.
+MAX_CONTENTS_BYTES = 1_800_000
 MAX_ERRORS_REPORTED = 20
 
 _NAME_TRIM = re.compile(r"\s+")
@@ -150,28 +151,37 @@ def parse(blob):
             continue
 
         prompt_id = _as_text(doc.get("id"))
-        prompt = _as_text(doc.get("prompt"))
         if not prompt_id:
             problems.append(f"line {line_no}: no \"id\"")
-            continue
-        if not prompt:
-            problems.append(f"line {line_no}: no \"prompt\"")
-            continue
-        if len(prompt) > MAX_PROMPT_CHARS:
-            problems.append(f"line {line_no}: prompt is longer than {MAX_PROMPT_CHARS:,} characters")
             continue
         if prompt_id in seen_ids:
             problems.append(
                 f"line {line_no}: id {prompt_id!r} already used on line {seen_ids[prompt_id]}")
             continue
 
-        labels = _as_labels(doc.get("expected_labels"))
-        if labels is None:
-            problems.append(f"line {line_no}: \"expected_labels\" is not a list of strings")
+        # `contents`는 AIRS 요청 본문 그대로다. 러너가 손대지 않고 POST하므로, 여기서 형태가
+        # 틀린 것을 통과시키면 실행 중에 400으로 되돌아온다 — 그때는 어느 행이 문제였는지
+        # 결과에 섞여 버리므로 업로드 시점에 거른다.
+        contents = doc.get("contents")
+        if not isinstance(contents, list) or not contents:
+            problems.append(f"line {line_no}: \"contents\" is not a non-empty array")
+            continue
+        if not all(isinstance(c, dict) and c for c in contents):
+            problems.append(f"line {line_no}: every \"contents\" element must be a JSON object")
+            continue
+        size = len(json.dumps(contents, ensure_ascii=False).encode("utf-8"))
+        if size > MAX_CONTENTS_BYTES:
+            problems.append(f"line {line_no}: contents is {size:,} bytes; the limit is "
+                            f"{MAX_CONTENTS_BYTES:,}")
             continue
 
-        row = {"row_no": len(rows) + 1, "prompt_id": prompt_id, "prompt": prompt,
-               "expected_labels": labels}
+        detectors = _as_labels(doc.get("expected_detector"))
+        if detectors is None:
+            problems.append(f"line {line_no}: \"expected_detector\" is not a list of strings")
+            continue
+
+        row = {"row_no": len(rows) + 1, "prompt_id": prompt_id, "contents": Jsonb(contents),
+               "expected_detector": detectors}
         bad_field = None
         for column in TEXT_COLUMNS:
             field = next(f for f, c in FIELD_TO_COLUMN.items() if c == column)
@@ -326,9 +336,12 @@ def summary(conn, dataset_id):
     if not head:
         return None
     out = dict(head)
-    out.update({"by_category": [], "by_verdict": [], "by_language": [], "techniques": []})
+    out.update({"by_category": [], "by_verdict": [], "by_language": [],
+                "by_checkpoint": [], "techniques": []})
     with conn.cursor() as cur:
-        for field in ("category", "verdict", "language"):
+        # 검사 시점도 함께 센다. 같은 위협이 채널에 따라 다른 시점에서 잡히므로, 세트가 어느
+        # 시점에 얼마나 치우쳐 있는지를 모르면 정탐율이 무엇의 정탐율인지 알 수 없다.
+        for field in ("category", "verdict", "language", "checkpoint"):
             cur.execute(
                 f"SELECT {field}, count(*) FROM benchmark.row WHERE dataset_id = %s "
                 f"GROUP BY {field} ORDER BY {field}", (dataset_id,))
@@ -349,8 +362,8 @@ def export_jsonl(conn, dataset_id):
 
     The export is normalised, not byte-identical: every known field is written, in the order the
     generator writes them, and fields the schema had no column for are merged back from `extra`
-    afterwards. A column cannot tell "the file had no severity" from "the file had an empty one" —
-    both are '' — so omitting the empties would drop a field that was really there, and writing
+    afterwards. A column cannot tell "the file had no checkpoint" from "the file had an empty one"
+    — both are '' — so omitting the empties would drop a field that was really there, and writing
     them all is the choice that never loses one. For a file from dataset/ the result is the input
     back exactly; for a file from elsewhere it gains the fields it did not carry, empty.
     """
@@ -358,18 +371,17 @@ def export_jsonl(conn, dataset_id):
     if not head:
         return None
 
-    ordered = ("id", "category", "category_ko", "category_en", "verdict", "expected",
-               "scan_target", "language", "technique", "expected_labels", "severity",
-               "origin", "prompt")
+    ordered = ("id", "category", "category_ko", "verdict", "expected_action", "checkpoint",
+               "expected_detector", "language", "technique", "note", "contents")
     lines = []
     with conn.cursor(name=f"bench_export_{dataset_id}") as cur:
-        # A server-side cursor: a set is thousands of rows with a prompt on each, and materialising
-        # all of them in one client-side list is the kind of thing that is fine until it is not.
+        # A server-side cursor: a set is thousands of rows each carrying a whole contents array,
+        # and materialising all of them in one client-side list is the kind of thing that is fine
+        # until it is not.
         cur.itersize = 500
         cur.execute(
-            "SELECT prompt_id, category, category_ko, category_en, verdict, expected, "
-            "       scan_target, language, technique, expected_labels, severity, origin, "
-            "       prompt, extra "
+            "SELECT prompt_id, category, category_ko, verdict, expected_action, checkpoint, "
+            "       expected_detector, language, technique, note, contents, extra "
             "FROM benchmark.row WHERE dataset_id = %s ORDER BY row_no", (dataset_id,))
         for record in cur:
             values = dict(zip(ordered, record[:-1]))
@@ -404,7 +416,10 @@ def scope_rows(conn, dataset_id, filters=None, search=""):
             where.append(f"{key} = %s")
             params.append(value)
     if search:
-        where.append("(prompt ILIKE %s OR prompt_id ILIKE %s)")
+        # contents는 JSONB라 ILIKE가 바로 붙지 않는다. ::text 로 직렬화해 훑으면 프롬프트든
+        # 도구 인자든 도구 결과든 한 조건으로 걸린다 — 검사 시점마다 값이 다른 필드에 들어 있어서
+        # 필드를 지정해 찾게 하면 콘솔에서 쓸 수 없다.
+        where.append("(contents::text ILIKE %s OR prompt_id ILIKE %s)")
         params += [f"%{search}%", f"%{search}%"]
 
     columns = [c for c in ROW_COLUMNS if c != "extra"]
@@ -430,7 +445,10 @@ def rows(conn, dataset_id, filters=None, search="", offset=0, limit=DEFAULT_LIMI
     if search:
         # ILIKE over the two columns an operator would look in, not a text index: a set is
         # thousands of rows, and an index here would be maintenance for no measurable gain.
-        where.append("(prompt ILIKE %s OR prompt_id ILIKE %s)")
+        # contents는 JSONB라 ILIKE가 바로 붙지 않는다. ::text 로 직렬화해 훑으면 프롬프트든
+        # 도구 인자든 도구 결과든 한 조건으로 걸린다 — 검사 시점마다 값이 다른 필드에 들어 있어서
+        # 필드를 지정해 찾게 하면 콘솔에서 쓸 수 없다.
+        where.append("(contents::text ILIKE %s OR prompt_id ILIKE %s)")
         params += [f"%{search}%", f"%{search}%"]
 
     clause = " WHERE " + " AND ".join(where)

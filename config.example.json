@@ -58,5 +58,31 @@
     "system_prompt": "You are the internal assistant for this company. Answer in the language the user writes in. If you do not know, say so rather than guessing.",
     "max_tokens": 512,
     "timeout_sec": 45
+  },
+  "route": {
+    "llm": "gateway",
+    "guardrail": "airs",
+    "require_guardrail": false
+  },
+  "airs": {
+    "endpoint": "https://service.api.aisecurity.paloaltonetworks.com",
+    "profile_name": "AIRS_Security_Profile",
+    "api_key": "",
+    "timeout_sec": 30,
+    "fail_open": false
+  },
+  "providers": {
+    "openai": {
+      "url": "https://api.openai.com/v1/chat/completions",
+      "api_key": ""
+    },
+    "anthropic": {
+      "url": "https://api.anthropic.com/v1/chat/completions",
+      "api_key": ""
+    },
+    "google": {
+      "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "api_key": ""
+    }
   }
 }

@@ -26,13 +26,13 @@ tail -f /var/log/pretzel-ai/pretzel-ai.log
 
 ## The AIRS gateway
 
-All gateway settings live in **`prisma-airs/config.json`** — host, port, scheme (`tls`), path,
+All gateway settings live in **`config.json`** at the repo root — host, port, scheme (`tls`), path,
 header names, model list, system prompt, and the key in `api_key`. See `src/config.py`.
 
 That file holds a secret, so it is **not** in the repo. Start from the template:
 
 ```bash
-cp prisma-airs/config.example.json prisma-airs/config.json
+cp config.example.json config.json
 ```
 
 then either fill in `api_key` or leave it empty and export `PZ_PORTKEY_API_KEY`.
@@ -41,8 +41,17 @@ Overrides:
 
 - `PZ_PORTKEY_API_KEY` — takes precedence over the `api_key` in config.json, so a deploy need not
   edit the file
+- `PZ_<SLUG>_API_KEY` — one per direct provider, named after its routing slug
+  (`@openai/gpt-4o-…` → `PZ_OPENAI_API_KEY`). Same precedence: the environment wins over the file
+- `PANW_AI_SEC_API_KEY` — the Prisma AIRS scan key
 - `PZ_PRETZEL_AI_GATEWAY_HOST` — gateway host, if not where config.json points
 - `PZ_PRETZEL_AI_CONFIG` — alternate config path
+
+Under systemd those come from **`/etc/pretzel-ai/keys.env`** (root, 0600), which `./pretzel-ai
+start` creates with a commented template on first run and never rewrites afterwards. The unit reads
+it as an `EnvironmentFile`, so a key never has to be written into `config.json` — which matters
+because the configuration document is on its way into the appliance's versioned running-config,
+where a secret would be permanent and visible in every review diff.
 
 The gateway itself must be deployed separately; until it is up on the configured host:port, turns
 return `UNREACHABLE`.
@@ -54,15 +63,20 @@ pretzel-ai                       the CLI dispatcher
 script/                          build / install / start / stop / clean
 src/grpc/pretzel_ai.proto        the mgmtd <-> pretzel-ai contract (source of truth,
                                  mirrored into pretzel/mgmtd/grpc/)
-src/main.py                      the entry point: args, log level, config, then serve
-src/grpc/serve.py                the gRPC transport: build the server, hold the port
-src/grpc/server.py               the gRPC handlers: Chat + the corpus and benchtest operations
+src/main.py                      the entry point: args and log level, then core.serve
+src/core.py                      the service: config -> engine -> gRPC server -> run
+src/factory.py                   which transport and which guardrail this deployment runs
+src/guardrail.py                 what an inspection says, with no vendor in the vocabulary
+src/airs/                        Prisma AIRS: the scan API client, and both guardrail shapes
+src/llm/                         the model call: gateway transport, direct transport, catalog
+src/chat/                        the turn: enforcement order, the agent loop, console adapter
+src/grpc/server.py               the servicer, composed from src/grpc/handlers/
 src/gateway.py                   the AIRS gateway call + scan-verdict extraction
-src/config.py                    loads prisma-airs/config.json → gateway config
+src/config.py                    loads config.json → the appliance config
 src/log.py                       rotating file log at /var/log/pretzel-ai
 src/crawler/                     the tech-doc crawler (sitemap → fetch → extract → store)
 sql/001_techdoc.sql              the pretzel_knowledge schema
-prisma-airs/config.example.json  template for the gateway config (copy to config.json)
+config.example.json              template for the config (copy to config.json)
 ```
 
 `src/grpc/` holds everything gRPC — the contract, the stubs `build` generates beside it, and the

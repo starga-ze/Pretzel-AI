@@ -1,5 +1,6 @@
 """Benchmark sets: the uploaded .jsonl files and the prompts inside them."""
 
+import json
 import logging
 
 import grpc
@@ -21,10 +22,12 @@ def _benchmark_row_msg(r):
     # untouched, and a proto Struct would rewrite number types on the way.
     return pretzel_ai_pb2.BenchmarkRow(
         row_no=r["row_no"], prompt_id=r["prompt_id"], category=r["category"],
-        category_ko=r["category_ko"], category_en=r["category_en"], verdict=r["verdict"],
-        expected=r["expected"], scan_target=r["scan_target"], language=r["language"],
-        technique=r["technique"], expected_labels=list(r["expected_labels"] or []),
-        severity=r["severity"], origin=r["origin"], prompt=r["prompt"],
+        category_ko=r["category_ko"], verdict=r["verdict"], expected_action=r["expected_action"],
+        checkpoint=r["checkpoint"], language=r["language"], technique=r["technique"],
+        expected_detector=list(r["expected_detector"] or []), note=r.get("note") or "",
+        # contents도 extra와 같은 이유로 JSON 텍스트다 — 콘솔에 손대지 않고 넘기고,
+        # proto Struct로 옮기면 벤더 스키마가 바뀔 때 이 파일까지 따라 바뀐다.
+        contents_json=json.dumps(r["contents"], ensure_ascii=False) if r.get("contents") else "",
         extra_json=json.dumps(r["extra"], ensure_ascii=False) if r["extra"] else "")
 
 class BenchmarkHandlers:
@@ -107,6 +110,7 @@ class BenchmarkHandlers:
             by_category=[pretzel_ai_pb2.BenchmarkBucket(**b) for b in got["by_category"]],
             by_verdict=[pretzel_ai_pb2.BenchmarkBucket(**b) for b in got["by_verdict"]],
             by_language=[pretzel_ai_pb2.BenchmarkBucket(**b) for b in got["by_language"]],
+            by_checkpoint=[pretzel_ai_pb2.BenchmarkBucket(**b) for b in got["by_checkpoint"]],
             techniques=[pretzel_ai_pb2.BenchmarkTechnique(**t) for t in got["techniques"]])
 
     def ListBenchmark(self, request, context):
@@ -115,7 +119,8 @@ class BenchmarkHandlers:
                 page = benchmark_store.rows(
                     conn, request.dataset_id,
                     filters={"category": request.category, "verdict": request.verdict,
-                             "language": request.language, "technique": request.technique},
+                             "language": request.language, "technique": request.technique,
+                             "checkpoint": request.checkpoint},
                     search=request.search,
                     offset=request.offset,
                     limit=request.limit or benchmark_store.DEFAULT_LIMIT,

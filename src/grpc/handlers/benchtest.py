@@ -24,8 +24,13 @@ def _live_case_msg(c):
     for an uninspected turn or a failed call, and sending that as false would score it as a miss."""
     return pretzel_ai_pb2.RunCase(
         seq=c["seq"], prompt_id=c["prompt_id"], category=c["category"], technique=c["technique"],
-        language=c["language"], expected=c["expected"], verdict=c["verdict"],
-        detectors=list(c["detectors"] or []), cause=c["cause"], ok=bool(c["ok"]),
+        language=c["language"], expected_action=c["expected_action"],
+        observed_action=c["observed_action"],
+        observed_detector=list(c.get("observed_detector") or []),
+        expected_detector=list(c.get("expected_detector") or []),
+        checkpoint=c.get("checkpoint") or "", outcome=c.get("outcome") or "",
+        threats=list(c.get("threats") or []),
+        cause=c["cause"], ok=bool(c["ok"]),
         excluded=c["ok"] is None, latency_ms=c["latency_ms"])
 
 def _stored_case_msg(c):
@@ -34,9 +39,13 @@ def _stored_case_msg(c):
     return pretzel_ai_pb2.RunCase(
         seq=c["seq"], prompt_id=c["prompt_id"], category=c.get("category") or "",
         technique=c.get("technique") or "", language=c.get("language") or "",
-        expected=c["expected"], verdict=c["verdict"], detectors=list(c["detectors"] or []),
+        expected_action=c["expected_action"], observed_action=c["observed_action"],
+        observed_detector=list(c.get("observed_detector") or []),
+        expected_detector=list(c.get("expected_detector") or []),
+        checkpoint=c.get("checkpoint") or "", outcome=c.get("outcome") or "",
+        threats=list(c.get("threats") or []), note=c.get("note") or "",
         cause=c["cause"], ok=bool(c["ok"]), excluded=c["ok"] is None,
-        latency_ms=c["latency_ms"] or 0, prompt=c.get("prompt") or "")
+        latency_ms=c["latency_ms"] or 0)
 
 def _run_progress(update):
     msg = pretzel_ai_pb2.RunProgress(
@@ -104,7 +113,8 @@ class BenchtestHandlers:
                 got = benchmark_runner.run_summary(
                     conn, request.run_id,
                     filters={"category": request.category, "verdict": request.verdict,
-                             "language": request.language, "technique": request.technique},
+                             "language": request.language, "technique": request.technique,
+                             "checkpoint": request.checkpoint},
                     search=request.search)
         except Exception as exc:                    # noqa: BLE001 - reported to the console
             log.exception("GetBenchtestRun failed")
@@ -117,6 +127,8 @@ class BenchtestHandlers:
             by_category=[pretzel_ai_pb2.BenchmarkBucket(**b) for b in got.get("by_category", [])],
             by_verdict=[pretzel_ai_pb2.BenchmarkBucket(**b) for b in got.get("by_verdict", [])],
             by_language=[pretzel_ai_pb2.BenchmarkBucket(**b) for b in got.get("by_language", [])],
+            by_checkpoint=[pretzel_ai_pb2.BenchmarkBucket(**b)
+                           for b in got.get("by_checkpoint", [])],
             techniques=[pretzel_ai_pb2.BenchmarkTechnique(
                 category="", technique=t["key"], count=t["count"])
                 for t in got.get("by_technique", [])],
@@ -128,7 +140,8 @@ class BenchtestHandlers:
                 page = benchmark_runner.cases(
                     conn, request.run_id, request.cause,
                     filters={"category": request.category, "verdict": request.verdict,
-                             "language": request.language, "technique": request.technique},
+                             "language": request.language, "technique": request.technique,
+                             "checkpoint": request.checkpoint},
                     search=request.search, offset=request.offset, limit=request.limit,
                     order_by=request.order_by, descending=request.descending)
         except Exception as exc:                    # noqa: BLE001 - reported to the console
@@ -149,6 +162,7 @@ class BenchtestHandlers:
             return pretzel_ai_pb2.BenchtestCaseDetail(error="no such case")
         return pretzel_ai_pb2.BenchtestCaseDetail(
             summary=_stored_case_msg(got), scan_id=got["scan_id"], caught=got["caught"],
-            http_status=got["http_status"] or 0, prompt=got.get("prompt", ""),
+            http_status=got["http_status"] or 0,
+            contents_json=got.get("contents_json", ""),
             response=got["response"], raw_request=got["raw_request"],
             raw_response=got["raw_response"], tool_calls=got["tool_calls"])

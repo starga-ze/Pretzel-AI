@@ -1,12 +1,10 @@
 # 실제 자격증명 — 절대 커밋 금지
-prisma-airs/config.json
-prisma-airs/*.bak
+config.json
+*.bak
 *.key
 
 # 벤치마크 실행 산출물 (게이트웨이 응답, 재생성 가능)
-dataset/run_*.jsonl
-dataset/run_*.py
-dataset/__pycache__/
+dataset/
 __pycache__/
 *.pyc
 
