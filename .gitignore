@@ -2,11 +2,40 @@
 config.json
 *.bak
 *.key
+*.pem
 
-# 벤치마크 실행 산출물 (게이트웨이 응답, 재생성 가능)
-dataset/
+# 파이썬 가상환경. requirements.txt 로 재생성한다 — 3,794개 파일을 버전관리할 이유가 없고,
+# 플랫폼·파이썬 버전이 다르면 그대로 쓰지도 못한다.
+.venv/
 __pycache__/
 *.pyc
+
+# 벤치마크 실행 산출물. 세트(dataset/final/)와 생성기가 있으면 언제든 다시 만들 수 있다.
+dataset/run_*.jsonl
+dataset/run_*.log
+dataset/sample_*.jsonl
+dataset/samples_pretty.json
+dataset/bench12_scan_bodies.json
+dataset/allocation_v2.tsv
+dataset/categories_v2.tsv
+dataset/session_memory.md
+
+# v1 잔재. 로컬에는 남겨 두되 추적하지 않는다 — v2 가 대체했고, 필요하면 커밋 6b0c58a 에서
+# 꺼내면 된다. templates.py 와 pools.py 는 예외로, templates_v2.py 가 지금도 import 하므로
+# 계속 추적한다.
+dataset/run_A.py
+dataset/run_bench.py
+dataset/generate.py
+dataset/score.py
+dataset/frames.py
+dataset/benchmark.jsonl
+dataset/benchmark.csv
+dataset/README.md
+script/load_benchmark.py
+
+# note 필드가 남아 있던 제출 전 판본. 최종본은 dataset/final/ 이다.
+dataset/benchmark_v2.jsonl
+dataset/benchmark_v2_pretty.json
 
 # 편집기 스왑
 *.swp
