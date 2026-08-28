@@ -39,3 +39,6 @@ dataset/benchmark_v2_pretty.json
 
 # 편집기 스왑
 *.swp
+
+# 패키지 산출물 (./pretzel-ai package)
+tmp/

@@ -6,6 +6,7 @@
     ./pretzel-ai start     # run the inference daemon under systemd (infinite loop)
     ./pretzel-ai stop      # stop + disable the daemon
     ./pretzel-ai clean     # remove generated stubs and caches
+    ./pretzel-ai package   # build an offline installer tarball for a prod host
 """
 import importlib.util
 import os
@@ -24,6 +25,7 @@ COMMAND_MAP = {
     "start": "script/start.py",
     "stop": "script/stop.py",
     "clean": "script/clean.py",
+    "package": "script/package.py",
 }
 
 # install/start/stop write /var/log/pretzel-ai and the systemd unit — both root-owned.
@@ -39,7 +41,7 @@ def ensure_root(cmd):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: ./pretzel-ai [build|install|start|stop|clean]")
+        print("Usage: ./pretzel-ai [build|install|start|stop|clean|package]")
         sys.exit(1)
 
     cmd = sys.argv[1]
