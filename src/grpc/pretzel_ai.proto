@@ -22,6 +22,26 @@ service PretzelAi {
   // what someone declared it should hold.
   rpc ListModels(ListModelsRequest) returns (ModelList);
 
+  // The assistant's deployment, pushed from the appliance. pretzel-ai is not on the IPC fabric, so
+  // engined's ConfigApply broadcast cannot reach it; this is that broadcast's equivalent for the
+  // one peer that lives off the bus.
+  //
+  // Push, not pull, and mgmtd is the one who pushes: engined owns the running config and mgmtd is
+  // the only process with both a gRPC channel to here and the master key that opens the sealed
+  // vendor credentials. pretzel-ai never reads the appliance database — a second writer, or even a
+  // second reader with its own idea of "current", is how a console and a service start disagreeing
+  // about what is deployed.
+  //
+  // Carries the keys. They are the one part that is not in running_config (it is append-versioned
+  // and rendered verbatim in a review diff), so they are unsealed at the last moment and travel
+  // here on a loopback channel — the same bargain the IPC socket already makes, where a device
+  // credential crosses in plaintext once on entry and never on use.
+  //
+  // Sent whenever the appliance has reason to believe this service's view is stale: at handshake,
+  // after a settings commit converges, and after a key is stored or removed. Idempotent, so
+  // sending it again costs nothing and a missed one is repaired by the next.
+  rpc ApplyConfig(ApplyConfigRequest) returns (ApplyConfigResult);
+
   // --- The tech-doc knowledge base -------------------------------------------------------
   //
   // The assistant answers out of a corpus crawled from docs.paloaltonetworks.com, and Palo Alto
@@ -148,6 +168,48 @@ message ChatChunk {
 }
 
 message ListModelsRequest {}
+
+// --- The pushed deployment ---------------------------------------------------------------
+
+message AiModel {
+  string id = 1;           // "gpt-4o-2024-11-20" — the bare name the vendor answers to; the
+                           // provider is the entry this sits under, not part of the id
+  string label = 2;        // "GPT-4o" — what the picker shows
+  string token_param = 3;  // the field this model wants its output cap in, when it is not
+                           // "max_tokens". Empty means the default.
+}
+
+message AiProvider {
+  string id = 1;                  // "openai" | "google" | "anthropic" — the half of a model name
+                                  // before the slash, and the id its key is sealed under. Named for
+                                  // the vendor, not the model family: the key belongs to Anthropic
+                                  // and the endpoint answers for Anthropic; Claude is what they serve.
+  repeated AiModel models = 2;    // the models this account may be asked for
+  string api_key = 3;             // unsealed by mgmtd for this call. Empty when none is stored,
+                                  // which is a provider that cannot serve — reported, not hidden.
+
+  // 4, 5 retired: `enabled` and `url`. A provider is taken out of service by not being in the list,
+  // which is how every other list in the appliance's configuration works; and the endpoint is a
+  // fact about the vendor rather than a setting, so it is compiled in on this side — an operator
+  // cannot point "openai" at something that is not OpenAI.
+}
+
+message ApplyConfigRequest {
+  // The running_config version this was read from. Not a gate — the service applies whatever
+  // arrives — but it is what makes a log line on either side answer "which configuration is this".
+  uint64 version = 1;
+  repeated AiProvider providers = 3;
+
+  // 2 retired: `assistant` (default model, system prompt, max tokens, timeout). None of it was an
+  // operator's choice about their vendors, and carrying it here made the appliance the authority on
+  // how this service shapes a turn. Those are pretzel-ai's own defaults now.
+}
+
+message ApplyConfigResult {
+  bool ok = 1;
+  string error = 2;     // why the document was refused; empty when ok
+  uint64 version = 3;   // echoed back, so a reply cannot be mistaken for one to a later push
+}
 
 message Model {
   string id = 1;        // "@openai/gpt-4o-2024-11-20" — sent to the gateway verbatim; the

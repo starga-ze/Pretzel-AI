@@ -25,6 +25,12 @@ log = logging.getLogger("pretzel-ai")
 # the surrounding log, and the cut is marked so a truncated value is never read as the whole.
 _DUMP_CAP = 2048
 
+# What a turn gets when there is no engine to run it. Reached on a fresh install, before the
+# appliance has pushed a deployment, and after a push that was refused left nothing behind — see
+# src/deployment.py. Worded for the console, which shows it to whoever typed.
+_UNCONFIGURED = ("no AI vendor is configured on this appliance — enable one and store its API key "
+                 "in Configuration > AI Provider")
+
 
 # How the completed reply is sliced into deltas for the console. Whitespace-preserving so the
 # reassembled text is byte-identical to result_json["reply"].
@@ -105,6 +111,10 @@ class ChatHandlers:
         # the gateway's inline hook or by nothing — was decided once at startup, in
         # factory.build_engine. This handler cannot tell and must not try: a branch here would be
         # a second place the deployment matrix is decided, and the two would drift.
+        if self._engine is None:
+            yield pretzel_ai_pb2.ChatChunk(done=True, error=_UNCONFIGURED)
+            return
+
         result = self._engine.run(
             request.message,
             model=request.model,
@@ -130,6 +140,9 @@ class ChatHandlers:
 
     def ListModels(self, request, context):
         """The picker's catalog. Unary and cheap — it is read once per page load."""
+        if self._engine is None:
+            return pretzel_ai_pb2.ModelList(error=_UNCONFIGURED)
+
         try:
             catalog = self._engine.catalog
             models = catalog.as_list()

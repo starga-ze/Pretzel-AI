@@ -48,7 +48,7 @@ class DirectTransport:
     """Implements src.llm.transport.LlmTransport against provider endpoints.
 
     Holds one endpoint per provider slug and picks by the model's slug, so a single appliance can
-    serve `@openai/…` and `@anthropic/…` in the same catalog without a gateway between.
+    serve `openai/…` and `claude/…` in the same catalog without a gateway between.
     """
 
     def __init__(self, endpoints: dict[str, Endpoint], *, timeout_sec: float = 45.0,
@@ -67,8 +67,13 @@ class DirectTransport:
         return "direct → " + ", ".join(sorted(self._endpoints))
 
     def endpoint_for(self, model: str) -> tuple[Endpoint | None, str]:
-        """→ (endpoint, error). The slug decides; a bare model name has nowhere to go."""
-        slug = model[1:].split("/", 1)[0] if model.startswith("@") and "/" in model else ""
+        """→ (endpoint, error). The slug decides; a bare model name has nowhere to go.
+
+        Both spellings are accepted, for the reason Model.slug gives: "@openai/…" is a gateway
+        config's, "openai/…" is the appliance's, and they name the same provider.
+        """
+        head = model[1:] if model.startswith("@") else model
+        slug = head.split("/", 1)[0] if "/" in head else ""
         if not slug:
             return None, (f"model '{model}' carries no provider slug, so there is no direct "
                           f"endpoint to send it to")

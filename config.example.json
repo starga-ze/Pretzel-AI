@@ -1,68 +1,15 @@
 {
-  "_comment": "Copy to config.json and fill in api_key, or leave it empty and export PZ_PORTKEY_API_KEY. The provider is selected through the model field as @<integration-slug>/<model>, per Portkey's SDK; no x-portkey-provider header is needed.",
+  "_comment": "This service's OWN half of the configuration. The other half — which vendors serve turns, their endpoints, their catalogs, the turn shape, and the vendor API keys — is pushed by the appliance over ApplyConfig and cached in deployment.json; do not put it here, it would be overwritten by the first push. What stays here is the guardrail, because an appliance changing which models it serves must not be able to change whether the turns are inspected.",
+  "route": {
+    "llm": "direct",
+    "guardrail": "airs",
+    "require_guardrail": false
+  },
+  "shape_defaults_note": "`gateway` is where the engine reads the catalog and turn shape from on either leg — a wart of the name, not the arrangement.",
   "gateway": {
-    "id": "portkey",
-    "host": "aigw.portkey.ai",
-    "port": 443,
-    "tls": true,
-    "path": "/v1/chat/completions",
-    "api_key_header": "x-portkey-api-key",
-    "api_key": "",
-    "models": [
-      {
-        "id": "@openai/gpt-4o-2024-11-20",
-        "label": "GPT-4o"
-      },
-      {
-        "id": "@openai/gpt-5.6-luna",
-        "label": "GPT-5.6 Luna",
-        "token_param": "max_completion_tokens"
-      },
-      {
-        "id": "@openai/gpt-5.6-sol",
-        "label": "GPT-5.6 Sol",
-        "token_param": "max_completion_tokens"
-      },
-      {
-        "id": "@openai/gpt-5.6-terra",
-        "label": "GPT-5.6 Terra",
-        "token_param": "max_completion_tokens"
-      },
-      {
-        "id": "@google/gemini-3.5-flash",
-        "label": "Gemini 3.5 Flash"
-      },
-      {
-        "id": "@google/gemini-3.5-flash-lite",
-        "label": "Gemini 3.5 Flash Lite"
-      },
-      {
-        "id": "@google/gemini-3.6-flash",
-        "label": "Gemini 3.6 Flash"
-      },
-      {
-        "id": "@anthropic/claude-opus-5",
-        "label": "Claude Opus 5"
-      },
-      {
-        "id": "@anthropic/claude-sonnet-5",
-        "label": "Claude Sonnet 5"
-      },
-      {
-        "id": "@anthropic/claude-fable-5",
-        "label": "Claude Fable 5"
-      }
-    ],
-    "default_model": "@openai/gpt-4o-2024-11-20",
-    "headers": {},
     "system_prompt": "You are the internal assistant for this company. Answer in the language the user writes in. If you do not know, say so rather than guessing.",
     "max_tokens": 512,
     "timeout_sec": 45
-  },
-  "route": {
-    "llm": "gateway",
-    "guardrail": "airs",
-    "require_guardrail": false
   },
   "airs": {
     "endpoint": "https://service.api.aisecurity.paloaltonetworks.com",
@@ -70,19 +17,5 @@
     "api_key": "",
     "timeout_sec": 30,
     "fail_open": false
-  },
-  "providers": {
-    "openai": {
-      "url": "https://api.openai.com/v1/chat/completions",
-      "api_key": ""
-    },
-    "anthropic": {
-      "url": "https://api.anthropic.com/v1/chat/completions",
-      "api_key": ""
-    },
-    "google": {
-      "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      "api_key": ""
-    }
   }
 }

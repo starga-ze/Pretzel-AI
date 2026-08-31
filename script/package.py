@@ -1,21 +1,21 @@
-"""./pretzel-ai package — prod 호스트로 옮길 오프라인 설치 tar 를 만든다.
+"""./pretzel-ai package — build the offline installer tarball for a production host.
 
-    ./pretzel-ai package              # tmp/pretzel-ai-package-<날짜>.tar.gz
-    ./pretzel-ai package --out /tmp   # 다른 곳에 떨군다
+    ./pretzel-ai package              # tmp/pretzel-ai-package-<stamp>.tar.gz
+    ./pretzel-ai package --out /tmp   # write it somewhere else
 
-prod 에는 저장소도, 컴파일러도, 인터넷도 없다고 가정한다. 그래서 tar 안에 들어가는 것은
-'실행에 필요한 것 전부'이고, 빌드에만 쓰이는 것은 하나도 넣지 않는다:
+A production host is assumed to have no repository, no compiler and no network. So the tarball
+carries everything needed to run, and nothing that is only needed to build:
 
-    src/          이미 생성된 gRPC 스텁 포함 (prod 에 protoc 이 필요 없다)
-    wheelhouse/   의존 라이브러리 휠 — pip 가 PyPI 를 보지 않아도 된다
-    sql/          스키마 이행
+    src/          the app, with the gRPC stubs already generated (no protoc on the host)
+    wheelhouse/   dependency wheels, so pip never has to reach PyPI
+    sql/          schema migrations
     requirements.txt, config.example.json
-    pretzel-ai-package  설치 스크립트 (script/installer.py)
+    pretzel-ai-package  the installer (script/installer.py)
 
-휠은 **이 호스트에서** 받는다. psycopg_binary·grpcio 처럼 네이티브 확장을 담은 휠은 glibc 와
-CPython ABI 에 묶여 있어서, 빌드 호스트와 prod 의 OS·파이썬이 다르면 그대로 쓰지 못한다.
-그래서 MANIFEST 에 OS 와 파이썬 버전을 적어 두고 설치 시점에 대조한다 — 안 맞으면 설치를
-시작하지 않고 멈춘다. 절반쯤 깔린 상태가 제일 고치기 어렵다.
+The wheels are downloaded **on this host**. Wheels carrying native extensions — psycopg_binary,
+grpcio — are tied to glibc and the CPython ABI, so a package built here will not install on a
+host with a different OS or Python. MANIFEST records both and the installer compares them before
+touching anything: a half-installed host is the hardest state to recover from.
 """
 
 import datetime
@@ -23,7 +23,6 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tarfile
 
@@ -31,13 +30,13 @@ from script.utils import ROOT_DIR, VENV_PIP, REQUIREMENTS, run_cmd
 
 NAME = "pretzel-ai-package"
 
-# tar 에 담을 것. 여기 없는 것은 prod 에 가지 않는다 — dataset/, .venv/, .git/, script/ 는
-# 전부 빌드·개발 자산이라 제외된다.
+# What goes in. Anything not listed here never reaches production — dataset/, .venv/, .git/ and
+# script/ are all build- or development-side assets.
 PAYLOAD_DIRS = ("src", "sql")
 PAYLOAD_FILES = ("requirements.txt", "config.example.json")
 
-# src/ 안에서도 빼는 것. __pycache__ 는 root 소유로 깔리면 나중에 성가시고, .proto 는
-# 스텁이 이미 생성돼 있으므로 prod 에 필요 없다(참조용으로 남길 이유는 있어 그대로 둔다).
+# Left out even from the directories above. Root-owned __pycache__ on a production host is a
+# nuisance later, and bytecode is regenerated on first import anyway.
 EXCLUDE_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache"}
 EXCLUDE_SUFFIX = (".pyc", ".pyo", ".swp", ".bak")
 
@@ -72,25 +71,34 @@ def _os_id():
 
 
 def _stubs_present():
-    """스텁이 없으면 prod 에서 protoc 을 돌려야 한다 — 그럴 수 없으므로 여기서 막는다."""
+    """Without the stubs the host would need protoc, which it does not have. Stop here instead."""
     grpc_dir = os.path.join(ROOT_DIR, "src", "grpc")
     need = ("pretzel_ai_pb2.py", "pretzel_ai_pb2_grpc.py")
     missing = [n for n in need if not os.path.isfile(os.path.join(grpc_dir, n))]
     if missing:
-        sys.exit(f"[Error] gRPC 스텁이 없다: {', '.join(missing)}\n"
-                 f"        먼저 ./pretzel-ai build 를 돌릴 것.")
+        sys.exit(f"[Error] gRPC stubs are missing: {', '.join(missing)}\n"
+                 f"        Run ./pretzel-ai build first.")
 
 
 def _build_wheelhouse(stage):
-    """requirements.txt 를 휠로 받아 둔다. prod 의 pip 는 --no-index 로 이것만 본다."""
+    """Fetch the dependency wheels. On the host, pip sees only these (--no-index).
+
+    pip, setuptools and wheel come along too, and not as a convenience. Debian and Ubuntu move
+    ensurepip into the python3-venv package, so a stock host can have python3 and still be unable
+    to make a venv that has pip in it. The installer therefore builds the venv with --without-pip
+    and bootstraps pip from the wheel below, which needs that wheel to be here."""
     wh = os.path.join(stage, "wheelhouse")
     os.makedirs(wh, exist_ok=True)
     run_cmd([VENV_PIP, "download", "-r", REQUIREMENTS, "-d", wh],
-            msg="의존 라이브러리 휠 내려받는 중 (빌드 호스트 기준)")
+            msg="Downloading dependency wheels (for this build host)")
+    run_cmd([VENV_PIP, "download", "pip", "setuptools", "wheel", "-d", wh],
+            msg="Downloading pip bootstrap wheels")
     n = len(os.listdir(wh))
     if n == 0:
-        sys.exit("[Error] 휠을 하나도 받지 못했다. 네트워크를 확인할 것.")
-    print(f"[*] wheelhouse: {n}개 휠")
+        sys.exit("[Error] No wheels were downloaded. Check the network.")
+    if not any(x.startswith("pip-") and x.endswith(".whl") for x in os.listdir(wh)):
+        sys.exit("[Error] No pip wheel was downloaded; the installer could not bootstrap pip.")
+    print(f"[*] Wheelhouse: {n} wheels")
     return n
 
 
@@ -110,18 +118,18 @@ def run():
         shutil.rmtree(stage_root)
     os.makedirs(stage)
 
-    print(f"[*] {NAME} 을(를) 만든다 — {_os_id()} / Python {sys.version.split()[0]}")
+    print(f"[*] Building {NAME} — {_os_id()} / Python {sys.version.split()[0]}")
 
     for d in PAYLOAD_DIRS:
         src = os.path.join(ROOT_DIR, d)
         if os.path.isdir(src):
             _copy_tree(src, os.path.join(stage, d))
-            print(f"  담음: {d}/")
+            print(f"  added: {d}/")
     for f in PAYLOAD_FILES:
         src = os.path.join(ROOT_DIR, f)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(stage, f))
-            print(f"  담음: {f}")
+            print(f"  added: {f}")
 
     _build_wheelhouse(stage)
 
@@ -129,7 +137,8 @@ def run():
     shutil.copy2(os.path.join(ROOT_DIR, "script", "installer.py"), installer)
     os.chmod(installer, 0o755)
 
-    # 무결성 목록. scp 로 옮기다 잘린 tar 를 설치 전에 잡으려는 것이다.
+    # Checksums, so the installer can reject a tarball truncated in transit before it writes
+    # anything.
     files = {}
     for root, dirs, names in os.walk(stage):
         dirs[:] = [d for d in dirs if not _skip(d)]
@@ -160,9 +169,9 @@ def run():
 
     size = os.path.getsize(tar_path) / 1048576
     print()
-    print(f"[*] 완성: {tar_path}  ({size:.1f} MB, {len(files)}개 파일)")
+    print(f"[*] Built: {tar_path}  ({size:.1f} MB, {len(files)} files)")
     print()
-    print("    prod 에서:")
+    print("    On the production host:")
     print(f"      scp {os.path.basename(tar_path)} prod:~/")
     print(f"      tar xzf {os.path.basename(tar_path)}")
     print(f"      cd {NAME} && sudo ./{NAME} install")

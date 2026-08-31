@@ -2,11 +2,6 @@
 """Client and server classes corresponding to protobuf-defined services."""
 import grpc
 
-# HAND PATCH — reapply after every `grpc_tools.protoc` run.
-# protoc writes a top-level `import pretzel_ai_pb2`, but these generated files live inside the
-# `src.grpc` package. Leave protoc's version in place and the daemon dies at startup with
-# ModuleNotFoundError: No module named 'pretzel_ai_pb2' — and systemd's restart loop makes it
-# look like a config problem rather than an import one.
 from src.grpc import pretzel_ai_pb2 as pretzel__ai__pb2
 
 
@@ -33,6 +28,11 @@ class PretzelAiStub(object):
                 '/pretzel.ai.v1.PretzelAi/ListModels',
                 request_serializer=pretzel__ai__pb2.ListModelsRequest.SerializeToString,
                 response_deserializer=pretzel__ai__pb2.ModelList.FromString,
+                )
+        self.ApplyConfig = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/ApplyConfig',
+                request_serializer=pretzel__ai__pb2.ApplyConfigRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.ApplyConfigResult.FromString,
                 )
         self.RefreshCorpus = channel.unary_stream(
                 '/pretzel.ai.v1.PretzelAi/RefreshCorpus',
@@ -136,6 +136,30 @@ class PretzelAiServicer(object):
         like a policy, and rolling the configuration back does not put a model back in the gateway
         account. Same reasoning as GetCorpusStatus, which reports what the store holds rather than
         what someone declared it should hold.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ApplyConfig(self, request, context):
+        """The assistant's deployment, pushed from the appliance. pretzel-ai is not on the IPC fabric, so
+        engined's ConfigApply broadcast cannot reach it; this is that broadcast's equivalent for the
+        one peer that lives off the bus.
+
+        Push, not pull, and mgmtd is the one who pushes: engined owns the running config and mgmtd is
+        the only process with both a gRPC channel to here and the master key that opens the sealed
+        vendor credentials. pretzel-ai never reads the appliance database — a second writer, or even a
+        second reader with its own idea of "current", is how a console and a service start disagreeing
+        about what is deployed.
+
+        Carries the keys. They are the one part that is not in running_config (it is append-versioned
+        and rendered verbatim in a review diff), so they are unsealed at the last moment and travel
+        here on a loopback channel — the same bargain the IPC socket already makes, where a device
+        credential crosses in plaintext once on entry and never on use.
+
+        Sent whenever the appliance has reason to believe this service's view is stale: at handshake,
+        after a settings commit converges, and after a key is stored or removed. Idempotent, so
+        sending it again costs nothing and a missed one is repaired by the next.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -288,6 +312,11 @@ def add_PretzelAiServicer_to_server(servicer, server):
                     request_deserializer=pretzel__ai__pb2.ListModelsRequest.FromString,
                     response_serializer=pretzel__ai__pb2.ModelList.SerializeToString,
             ),
+            'ApplyConfig': grpc.unary_unary_rpc_method_handler(
+                    servicer.ApplyConfig,
+                    request_deserializer=pretzel__ai__pb2.ApplyConfigRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.ApplyConfigResult.SerializeToString,
+            ),
             'RefreshCorpus': grpc.unary_stream_rpc_method_handler(
                     servicer.RefreshCorpus,
                     request_deserializer=pretzel__ai__pb2.RefreshCorpusRequest.FromString,
@@ -409,6 +438,23 @@ class PretzelAi(object):
         return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListModels',
             pretzel__ai__pb2.ListModelsRequest.SerializeToString,
             pretzel__ai__pb2.ModelList.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ApplyConfig(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ApplyConfig',
+            pretzel__ai__pb2.ApplyConfigRequest.SerializeToString,
+            pretzel__ai__pb2.ApplyConfigResult.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 

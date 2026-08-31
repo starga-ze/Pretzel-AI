@@ -17,6 +17,7 @@ from src.grpc import pretzel_ai_pb2_grpc
 from src.grpc.handlers.benchmark import BenchmarkHandlers
 from src.grpc.handlers.benchtest import BenchtestHandlers
 from src.grpc.handlers.chat import ChatHandlers
+from src.grpc.handlers.config import ConfigHandlers
 from src.grpc.handlers.corpus import CorpusHandlers
 
 log = logging.getLogger("pretzel-ai")
@@ -24,6 +25,7 @@ log = logging.getLogger("pretzel-ai")
 
 class PretzelAiServicer(
     ChatHandlers,
+    ConfigHandlers,
     CorpusHandlers,
     BenchmarkHandlers,
     BenchtestHandlers,
@@ -37,8 +39,17 @@ class PretzelAiServicer(
     UNIMPLEMENTED rather than AttributeError.
     """
 
-    def __init__(self, engine):
-        # The engine already holds the transport and the guardrail that config selected. Handlers
+    def __init__(self, deployment):
+        # The deployment owns the engine and can replace it: ApplyConfig arrives while the service
+        # is running, so what a handler must not do is capture the engine once. It reads
+        # `self._engine` per call, which is a property onto whatever the deployment currently
+        # holds — a turn already in flight keeps the one it started on.
+        #
+        # The engine holds the transport and the guardrail that configuration selected. Handlers
         # take it as given: none of them may ask which route this appliance is running, because a
         # handler that branched on it would be a second place the matrix is decided.
-        self._engine = engine
+        self._deployment = deployment
+
+    @property
+    def _engine(self):
+        return self._deployment.engine

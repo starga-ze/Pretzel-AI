@@ -41,10 +41,17 @@ class Model:
 
     @property
     def slug(self) -> str:
-        """The routing slug, or "" for a bare model name."""
-        if not self.id.startswith("@") or "/" not in self.id:
+        """The routing slug, or "" for a bare model name.
+
+        Two spellings, one meaning. "@openai/gpt-4o" is Portkey's, and a config.json written for a
+        gateway still uses it; "openai/gpt-4o" is the appliance's, which has no gateway in it and
+        no reason to carry a gateway's punctuation. The "@" is stripped rather than required so
+        both reach the same endpoint.
+        """
+        head = self.id[1:] if self.id.startswith("@") else self.id
+        if "/" not in head:
             return ""
-        return self.id[1:].split("/", 1)[0]
+        return head.split("/", 1)[0]
 
     @property
     def bare(self) -> str:
