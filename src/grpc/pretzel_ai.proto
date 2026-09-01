@@ -194,15 +194,99 @@ message AiProvider {
   // cannot point "openai" at something that is not OpenAI.
 }
 
+// Which of the four points in a turn are inspected.
+//
+// Four switches rather than one, because their consequences differ: a skipped tool_call is
+// irreversible once the tool has run, while a skipped response only means nobody read the answer
+// first. Off does NOT mean allow — the checkpoint answers NOT_INSPECTED, so a report can still
+// tell a clean scan from one that never ran.
+//
+// Not every combination is reachable, and the unreachable ones are a fact about the deployment
+// rather than a setting: Chat has no tools at all, and the AI gateway cannot see them (it builds
+// its scan request from a completion's text `content`, and `tool_calls` is a sibling of `content`
+// that never reaches the scanner). pretzel-ai reads these against what the service and the
+// guardrail can actually serve; the console greys out what it cannot.
+message Checkpoints {
+  bool prompt = 1;        // before the model is called
+  bool response = 2;      // after it answers, before anyone sees it
+  bool tool_call = 3;     // after the model asks for a tool, BEFORE it runs
+  bool tool_result = 4;   // after the tool ran, before its output re-enters the turn
+}
+
+// One of the services this appliance runs, and how its turns are inspected.
+//
+// Two of them, and they are separate engines rather than one engine in two modes: Chat calls a
+// model and returns, Agent loops through tool calls. They are configured apart because the
+// question "what should be inspected here" has different answers — Agent has two checkpoints Chat
+// does not have, and an operator tuning one is not tuning the other.
+//
+// This travels now, and the guardrail half of it did not before. The earlier contract left the
+// guardrail in pretzel-ai's own config.json so that an appliance changing which models it serves
+// could not — by a console edit or a bug in one — change whether the turns were inspected. That
+// bargain also made the guardrail unconfigurable without editing a file on the appliance and
+// restarting the service, which is not something an operator can be asked to do. The console owns
+// it now, the file is gone, and the protection is that every change is a committed, versioned
+// running_config edit rendered in a review diff.
+message ServiceConfig {
+  string service = 1;     // "chat" | "agent" — which engine this configures. One entry each.
+
+  // Who inspects, and by consequence which LLM leg serves the completion:
+  //   "none"             nobody inspects; the vendors are called directly. A real deployment,
+  //                      written down — every checkpoint reports NOT_INSPECTED rather than allowing.
+  //   "api_application"  this appliance calls the Prisma AIRS scan API and holds the enforcement
+  //                      point; the vendors are called directly.
+  //   "ai_gateway"       the AI gateway routes the completion AND its own configuration governs
+  //                      inspection. The leg is not a separate choice: there is no gateway on the
+  //                      direct path to defer to, so choosing this moves the completion too.
+  string guardrail = 2;
+
+  Checkpoints checkpoints = 3;
+
+  // api_application only. The endpoint is not here: it is a fact about the scan service, compiled
+  // into pretzel-ai, and a console field for it only ever bought the chance to point "AIRS" at
+  // something that is not AIRS.
+  string airs_profile_name = 4;    // the security profile a scan is ruled against
+  double airs_timeout_sec = 5;
+  bool   airs_fail_open = 6;       // a scan that cannot be reached lets the turn through. Default
+                                   // false: a guardrail that cannot rule stops the turn.
+
+  // ai_gateway only. The endpoint is likewise compiled in — the hosted gateway.
+  bool   gateway_require_verdict = 7;  // fail turns the gateway did not inspect. Without it,
+                                       // deferring means trusting that something over there looked.
+  double gateway_timeout_sec = 8;
+
+  // How this service shapes a turn. Per service on purpose: an agent's system prompt is not a
+  // chat's, and neither is its token cap.
+  string system_prompt = 9;   // empty leaves pretzel-ai's own default in place
+  int32  max_tokens = 10;     // 0 means unset
+}
+
 message ApplyConfigRequest {
   // The running_config version this was read from. Not a gate — the service applies whatever
   // arrives — but it is what makes a log line on either side answer "which configuration is this".
   uint64 version = 1;
   repeated AiProvider providers = 3;
 
-  // 2 retired: `assistant` (default model, system prompt, max tokens, timeout). None of it was an
-  // operator's choice about their vendors, and carrying it here made the appliance the authority on
-  // how this service shapes a turn. Those are pretzel-ai's own defaults now.
+  // Every service, whole, every time. An absent field in a proto3 message is indistinguishable
+  // from a default, so a partial push could not express "clear the system prompt" or "stop
+  // inspecting tool results" — mgmtd writes every field on every push, read from the running
+  // config it just committed.
+  repeated ServiceConfig services = 6;
+
+  // The subscription keys, unsealed by mgmtd for this call. Appliance-wide rather than per
+  // service: there is one AIRS subscription and one gateway subscription, and both services draw
+  // on whichever they reference. Empty means none is stored — a service that needs it is a
+  // configuration pretzel-ai refuses, reported rather than hidden.
+  //
+  // Not in running_config: that document is append-versioned and rendered verbatim in a review
+  // diff, which is no place for a credential.
+  string airs_api_key = 7;
+  string gateway_api_key = 8;
+
+  // 2 retired: `assistant` (default model, system prompt, max tokens, timeout) — now per service
+  //   in ServiceConfig above.
+  // 4, 5 retired: `guardrail` and `shape`, a single appliance-wide pair from when there was one
+  //   engine. They became per-service the moment Chat and Agent were configured apart.
 }
 
 message ApplyConfigResult {

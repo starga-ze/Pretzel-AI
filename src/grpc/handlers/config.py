@@ -9,11 +9,18 @@ running config is engined's, the sealed credentials are opened by mgmtd, and a s
 with its own idea of "current" is how a console and a service start disagreeing about what is
 deployed. So the appliance says it, and this applies it.
 
-What it does NOT carry: the guardrail (route.guardrail and the `airs` block stay in this service's
-own config.json, so an appliance changing which models it serves cannot — by an edit in a console,
-or by a bug in one — change whether the turns are inspected); the endpoints (a fact about each
-vendor, compiled in here); and the turn shape (system prompt, token cap, timeout — how THIS service
-shapes a turn, not a statement the appliance makes about the operator's vendor accounts).
+It carries the guardrail now, and it did not use to. That block lived in this service's own
+config.json on the argument that an appliance changing which models it serves must not be able to
+change whether the turns are inspected. The file is gone: what that argument bought was a guardrail
+nobody could reconfigure without editing a file on the appliance and restarting the service, and
+what replaces it is that every change here is a committed, versioned running_config edit a reviewer
+sees in the diff.
+
+It carries one entry per engine — chat and agent — because the two are configured apart: agent has
+two checkpoints chat does not have, and the AI gateway can see neither of them.
+
+What it still does NOT carry: the endpoints. The vendors', the scan service's and the gateway's are
+each a fact about the thing being called, and all three are compiled in here.
 """
 
 import logging
@@ -24,12 +31,38 @@ from src.grpc import pretzel_ai_pb2
 log = logging.getLogger("pretzel-ai")
 
 
+def _service(entry):
+    """One ServiceConfig as the plain dict src.deployment.Deployment merges."""
+    cp = entry.checkpoints
+    return {
+        "service": entry.service,
+        "guardrail": entry.guardrail,
+        "checkpoints": {
+            "prompt": cp.prompt,
+            "response": cp.response,
+            "tool_call": cp.tool_call,
+            "tool_result": cp.tool_result,
+        },
+        "airs_profile_name": entry.airs_profile_name,
+        "airs_timeout_sec": entry.airs_timeout_sec,
+        "airs_fail_open": entry.airs_fail_open,
+        "gateway_require_verdict": entry.gateway_require_verdict,
+        "gateway_timeout_sec": entry.gateway_timeout_sec,
+        "system_prompt": entry.system_prompt,
+        "max_tokens": entry.max_tokens,
+    }
+
+
 def _document(request):
     """The protobuf request as the plain dict src.deployment.Deployment merges.
 
     Written out field by field rather than through MessageToDict because the two are not the same
     document: an absent `token_param` has to survive as an absence, and the conversion helpers
     differ on whether a proto3 default is a value or a missing field.
+
+    Every field, always — mgmtd writes every field on every push for the same reason, and a dict
+    built by picking out the non-defaults would reintroduce exactly the ambiguity the two sides
+    agreed to avoid.
     """
     return {
         "version": int(request.version),
@@ -44,6 +77,9 @@ def _document(request):
             }
             for p in request.providers
         ],
+        "services": [_service(s) for s in request.services],
+        "airs_api_key": request.airs_api_key,
+        "gateway_api_key": request.gateway_api_key,
     }
 
 
@@ -54,12 +90,27 @@ class ConfigHandlers:
         document = _document(request)
 
         provs = document["providers"]
-        # Counted, never logged. Which vendors are configured is operational information; the keys
-        # are not, and neither are their lengths.
-        log.info("ApplyConfig: version=%s, providers=%d (keyed=%d), models=%d",
+        # Counted and named, never valued. Which vendors are configured and which checkpoints are
+        # live is operational information; the keys are not, and neither are their lengths.
+        shape = ", ".join(
+            "%s=%s(%s)" % (
+                s["service"] or "?",
+                s["guardrail"] or "?",
+                "+".join(n for f, n in (("prompt", "prompt"), ("response", "response"),
+                                        ("tool_call", "tool-call"),
+                                        ("tool_result", "tool-result"))
+                         if s["checkpoints"][f]) or "none",
+            )
+            for s in document["services"]
+        )
+        log.info("ApplyConfig: version=%s, providers=%d (keyed=%d), models=%d, services=[%s], "
+                 "airs_key=%s, gateway_key=%s",
                  document["version"] or "unknown", len(provs),
                  sum(1 for p in provs if p["api_key"]),
-                 sum(len(p["models"]) for p in provs))
+                 sum(len(p["models"]) for p in provs),
+                 shape or "none configured",
+                 "stored" if document["airs_api_key"] else "none",
+                 "stored" if document["gateway_api_key"] else "none")
 
         try:
             self._deployment.apply(document)

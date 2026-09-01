@@ -1,24 +1,84 @@
-"""The appliance config: a single JSON file (config.json at the repo root).
+"""The defaults this service falls back to, and the credentials it resolves from the environment.
 
-config.json fully owns the gateway — host, port, scheme (tls), path, header names, model list,
-system prompt, and the key itself in the `api_key` field. Because it carries a secret it is not in
-the repo; config.example.json is the template to copy from.
+There is no config file any more. Until recently pretzel-ai read config.json at startup: the
+guardrail, the turn shape and the direct-provider endpoints lived there, and changing any of them
+meant editing a file on the appliance and restarting the service. That is not something an
+operator can be asked to do, so all of it moved into the appliance's running config and arrives
+over ApplyConfig — see src/deployment.py, which lays the pushed document over what is below.
 
-Key precedence: PZ_PORTKEY_API_KEY in the environment wins (so a deploy can override without
-editing the file), otherwise the `api_key` in config.json. Host may be overridden with
-PZ_PRETZEL_AI_GATEWAY_HOST for a gateway that is not where config.json points.
+What stays here is what a document cannot supply:
+
+    DEFAULTS        the values a service with no push yet runs on. Not a configuration anybody
+                    deploys — it has no models, so it cannot serve a turn — but a complete enough
+                    document that the engine's builder fails on the one thing that is actually
+                    missing rather than on a KeyError three layers down.
+    credentials     keys taken from the environment. The appliance's sealed store is where they
+                    come from in a deployment; the environment is what makes this service runnable
+                    on its own, for a developer or a benchmark run with no appliance in front of it.
+
+Precedence changed with the file's removal, and in the direction that matters: a pushed key now
+WINS over the environment. It used to be the other way, because the environment was the way to
+avoid writing a key into a config document. There is no such document now, and an env var that
+outranked the console would mean an operator rotating a key in the UI and watching nothing happen.
 """
 
-import json
+import copy
 import os
+
+# Where each vendor's key is looked for when nothing has been pushed. The name is the provider slug
+# upper-cased — the half of a model id before the slash.
+PROVIDER_KEY_ENV = "PZ_{slug}_API_KEY"
+AIRS_KEY_ENV = "PANW_AI_SEC_API_KEY"
+GATEWAY_KEY_ENV = "PZ_PORTKEY_API_KEY"
+
+# The document a service with no push runs on.
+#
+# `route.llm` is "direct" and not a choice: the appliance's deployment names vendors, and the
+# gateway leg has no configuration source left now that config.json is gone. It stays in the
+# vocabulary because factory.py still builds either leg and the benchmark harness still points at
+# a gateway when that is what is under test.
+#
+# The guardrail defaults to inspecting all four checkpoints. A service that came up inspecting
+# nothing and waited to be told otherwise would be one push away from a deployment nobody chose;
+# defaulting the other way makes the failure mode "the guardrail refuses to build without a key",
+# which is loud and correct.
+DEFAULTS = {
+    "route": {
+        "llm": "direct",
+        "guardrail": "airs",
+        "require_guardrail": False,
+    },
+    # `gateway` is where the factory reads the catalog and the turn shape from on either leg — a
+    # wart of the name, not of the arrangement.
+    "gateway": {
+        "system_prompt": "",
+        "max_tokens": 4096,
+        "timeout_sec": 45,
+        "models": [],
+        "default_model": "",
+    },
+    "airs": {
+        "endpoint": "",
+        "profile_name": "",
+        "api_key": "",
+        "timeout_sec": 30,
+        "fail_open": False,
+        "checkpoints": {
+            "prompt": True,
+            "response": True,
+            "tool_call": True,
+            "tool_result": True,
+        },
+    },
+    "providers": {},
+}
 
 
 class MultiCredentials:
     """One key per credential id, resolved for the process.
 
-    Same `.key(id)` shape as StaticCredentials so nothing downstream cares which it got; the
-    difference is that a direct-route appliance holds several keys at once — one per provider —
-    while a gateway-route one holds exactly the gateway's.
+    Holds whatever the deployment resolved — a pushed key, or an environment one where nothing was
+    pushed. The `.key(id)` shape is what the transports call; they do not care which it was.
     """
 
     def __init__(self, keys):
@@ -26,7 +86,7 @@ class MultiCredentials:
 
     def key(self, credential_id=None):
         if credential_id is None:
-            # No id asked for: the gateway's, which is the only key a single-route appliance has.
+            # No id asked for: the only key there is. A single-route deployment has exactly one.
             return next((v for v in self._keys.values() if v), "")
         return self._keys.get(credential_id, "")
 
@@ -35,85 +95,14 @@ class MultiCredentials:
         return sorted(k for k, v in self._keys.items() if v)
 
 
-class StaticCredentials:
-    """The resolved gateway key, held for the process. Mirrors the old GatewayCredentialService
-    interface (`.key(id)`) so GatewayService does not care where the value came from."""
-
-    def __init__(self, key):
-        self._key = key or ""
-
-    def key(self, _credential_id=None):
-        return self._key
+def defaults():
+    """A fresh copy of DEFAULTS. Copied because Deployment merges into its base in place."""
+    return copy.deepcopy(DEFAULTS)
 
 
-def _providers(config):
-    """The `providers` block as {slug: entry}, whichever of the two shapes it arrived in."""
-    raw = config.get("providers")
-    if isinstance(raw, dict) and isinstance(raw.get("list"), list):
-        raw = raw["list"]
-    if isinstance(raw, list):
-        out = {}
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            slug = str(entry.get("id", "")).strip()
-            if slug:
-                out[slug] = {k: v for k, v in entry.items() if k != "id"}
-        return out
-    return raw or {}
+def env_key(name):
+    return os.environ.get(name, "").strip()
 
 
-def load(config_path):
-    """→ (config_document, credentials).
-
-    The whole document, not just the gateway block: `route` decides which transport and which
-    guardrail this appliance runs, `airs` holds the scan service, and `providers` the direct
-    endpoints. Returning one slice of it was fine when there was one route.
-
-    Secrets are taken OUT of the returned document and handed back through `credentials`, so a
-    caller that logs its config — and something always does — cannot log a key with it.
-    """
-    with open(config_path) as f:
-        config = json.load(f)
-    if not isinstance(config, dict):
-        raise ValueError(f"{config_path}: expected a JSON object at the top level")
-
-    gateway = dict(config.get("gateway") or {})
-    keys = {}
-
-    # Environment wins over the file, so a deploy can rotate a key without editing it.
-    gateway_key = gateway.pop("api_key", "")
-    keys[gateway.get("id", "portkey")] = (
-        os.environ.get("PZ_PORTKEY_API_KEY", "").strip() or gateway_key)
-
-    host_override = os.environ.get("PZ_PRETZEL_AI_GATEWAY_HOST", "").strip()
-    if host_override:
-        gateway["host"] = host_override
-    config["gateway"] = gateway
-
-    # The scan service's key stays in its own block rather than in `credentials`: AirsConfig is
-    # built from that block whole, and splitting one field out would mean threading it back in.
-    airs = dict(config.get("airs") or {})
-    if airs or os.environ.get("PANW_AI_SEC_API_KEY"):
-        airs["api_key"] = (os.environ.get("PANW_AI_SEC_API_KEY", "").strip()
-                           or airs.get("api_key", ""))
-        config["airs"] = airs
-
-    # One key per provider, under the provider's own slug, so the direct transport asks for
-    # "openai" and gets the OpenAI key.
-    #
-    # Two shapes are accepted for the same thing. A map keyed by slug is what a hand-written
-    # config.json says; a list of {id, url} entries is what the appliance's running-config carries,
-    # because a commit merges values into the stored document and a merged map can only ever gain
-    # keys — removing a provider would be unexpressible there. Normalised to the map here so
-    # nothing downstream has to know which end the config came from.
-    providers = {}
-    for slug, raw in _providers(config).items():
-        entry = dict(raw)
-        env_name = f"PZ_{slug.upper().replace('-', '_')}_API_KEY"
-        keys[slug] = os.environ.get(env_name, "").strip() or entry.pop("api_key", "")
-        providers[slug] = entry
-    if providers:
-        config["providers"] = providers
-
-    return config, MultiCredentials(keys)
+def provider_env_key(slug):
+    return env_key(PROVIDER_KEY_ENV.format(slug=slug.upper().replace("-", "_")))

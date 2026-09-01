@@ -35,8 +35,8 @@ WorkingDirectory={root}
 # on disk records what the running daemon was told. DEBUG makes the daemon dump the text operators
 # typed (see PretzelAiServicer.Chat), which is why it is not the default and not a runtime toggle.
 Environment="PZ_PRETZEL_AI_LOG_LEVEL={log_level}"
-# Keys live here, not in the repo and not in the config document. The leading '-' means a missing
-# file is not an error: an appliance running through the gateway needs nothing in it.
+# Keys live here, not in the repo. The leading '-' means a missing file is not an error, which is
+# the normal case: in a deployment every key arrives from the appliance over ApplyConfig.
 EnvironmentFile=-{env_file}
 ExecStart={python} -m src.main --listen {listen}
 Restart=always
@@ -53,9 +53,9 @@ WantedBy=multi-user.target
 ENV_TEMPLATE = """\
 # pretzel-ai keys — root-only, read by the systemd unit as an EnvironmentFile.
 #
-# Every one of these wins over the matching field in config.json (see src/config.py),
-# so a key never has to be written into the config document. Uncomment and fill in the ones this
-# deployment's route actually uses, then `sudo ./pretzel-ai start`.
+# A fallback, not the source. In a deployment the appliance pushes these over ApplyConfig from its
+# sealed store, and a pushed key WINS over anything here. Uncomment and fill in only to run this
+# service without an appliance in front of it, then `sudo ./pretzel-ai start`.
 #
 # No quotes, no `export`, one per line. Nothing here is read while the daemon is running: the
 # environment is what the unit hands the process at start.

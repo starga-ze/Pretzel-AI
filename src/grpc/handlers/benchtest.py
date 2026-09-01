@@ -82,7 +82,7 @@ class BenchtestHandlers:
                 filters={"category": request.category, "verdict": request.verdict,
                          "language": request.language, "technique": request.technique},
                 search=request.search, workers=request.workers, label=request.label,
-                note=request.note)
+                note=request.note, engine=self._deployment.engine)
             for update in generator:
                 if not context.is_active():
                     break

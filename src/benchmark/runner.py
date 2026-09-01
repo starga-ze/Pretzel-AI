@@ -26,14 +26,10 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from src import config as pa_config
 from src.benchmark import store
 from src.benchmark.caller import EngineCaller
-from src.factory import build_engine
 
 log = logging.getLogger("pretzel-ai.benchmark.runner")
-
-CONFIG_PATH = "/home/jinho/pretzel-ai/config.json"
 
 # The detector each category exists to exercise. A hit from anything else is a block on the wrong
 # grounds and is counted separately from a clean one.
@@ -116,11 +112,16 @@ def classify(row, res):
 
 
 def run(conn, dataset_id, filters=None, search="", workers=DEFAULT_WORKERS,
-        label="", note="", config_path=CONFIG_PATH):
+        label="", note="", engine=None):
     """Execute a run and yield progress. The last thing yielded has final=True.
 
     The caller cancels by not asking for the next item; the run is then marked cancelled with the
     cases it managed to complete, which is why `selected` is stored separately from their count.
+
+    `engine` is the deployment's, handed in by the servicer. It used to be built here from a config
+    file, which meant a run could be measuring a different deployment from the one the appliance
+    was serving — the file said one thing and the last ApplyConfig said another. There is no file
+    now, and the run is scored against exactly what the console is running.
     """
     # 데이터셋 v2의 실행 경로는 아직 없다. v1 러너는 행의 `prompt` 한 줄을 엔진에 태워 모델을
     # 부르고 그 왕복을 채점했는데, v2는 행이 곧 AIRS 요청(`contents`)이라 모델을 부르지 않고
@@ -146,13 +147,12 @@ def run(conn, dataset_id, filters=None, search="", workers=DEFAULT_WORKERS,
                "error": "No prompt matches this filter."}
         return
 
-    try:
-        config, credentials = pa_config.load(config_path)
-        caller = EngineCaller(build_engine(config, credentials))
-    except Exception as exc:                        # noqa: BLE001 - reported to the console
+    if engine is None:
         yield {"stage": "failed", "done": 0, "total": len(rows), "final": True,
-               "error": f"configuration unusable: {exc}"}
+               "error": "the appliance has not pushed a working deployment yet — "
+                        "there is nothing to run this set against"}
         return
+    caller = EngineCaller(engine)
 
     # Which route this run measured. Recorded in the log because a result read next week means
     # nothing without it: the same set through the gateway and through the scan API answers

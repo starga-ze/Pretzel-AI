@@ -1,7 +1,7 @@
 """pretzel-ai's entry point — the counterpart to mgmtd/main.cpp on the other side of the wire.
 
-Everything that happens once, at start: read the command line, decide the log level, find the
-config, hand off to src/core.py. Nothing about a chat turn is decided here, and nothing here is
+Everything that happens once, at start: read the command line, decide the log level, hand off to
+src/core.py. Nothing about a chat turn is decided here, and nothing here is
 imported by anything that serves one — which is the point of the file existing. `core.serve` is
 importable on its own, so a test or a foreground probe can bring the service up without going
 through argument parsing.
@@ -21,13 +21,6 @@ log = logging.getLogger("pretzel-ai")
 LOG_LEVELS = ("debug", "info", "warning", "error")
 
 
-def default_config():
-    """The gateway config, unless the environment names another one."""
-    # src/main.py -> src -> the repo root.
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.environ.get("PZ_PRETZEL_AI_CONFIG", "") or os.path.join(root, "config.json")
-
-
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(prog="pretzel-ai",
                                  description="pretzel-ai gRPC inference service")
@@ -40,8 +33,6 @@ def parse_args(argv=None):
                     default=os.environ.get("PZ_PRETZEL_AI_LOG_LEVEL", "info").lower(),
                     choices=LOG_LEVELS,
                     help="daemon log level (default: info)")
-    ap.add_argument("--config", default=default_config(),
-                    help="path to the config json (default: <repo root>/config.json)")
     return ap.parse_args(argv)
 
 
@@ -52,7 +43,7 @@ def main(argv=None):
     if args.log_level == "debug":
         log.warning("log level is DEBUG — request dumps include the text operators typed")
 
-    serve(args.listen, args.config)
+    serve(args.listen)
 
 
 if __name__ == "__main__":

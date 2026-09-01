@@ -165,8 +165,11 @@ class ChatEngine:
 
     @property
     def describes(self) -> str:
-        return (f"{self._transport.describes} · guardrail="
-                f"{type(self._guardrail).__name__}"
+        # A guardrail may describe itself — CheckpointGate does, because the class name alone would
+        # say a gate is deployed without saying which of the four points it lets through, and that
+        # is the one fact a reader of this line needs. Everything else falls back to its type.
+        guardrail = getattr(self._guardrail, "describes", None) or type(self._guardrail).__name__
+        return (f"{self._transport.describes} · guardrail={guardrail}"
                 f"{' · fail-open' if self._fail_open else ''}")
 
     # ── One turn ─────────────────────────────────────────────────────────────────────────

@@ -18,8 +18,6 @@ PROTO_FILE = os.path.join(GRPC_DIR, "pretzel_ai.proto")
 PROTO_DIR = GRPC_DIR
 PKG_DIR = os.path.join(ROOT_DIR, "src")
 
-CONFIG_FILE = os.path.join(ROOT_DIR, "config.json")
-
 # One daemon today; the log path is per-daemon so `tail -f /var/log/pretzel-ai/<daemon>.log`
 # generalises if pretzel-ai ever grows a second process.
 DAEMON = "pretzel-ai"
@@ -29,13 +27,16 @@ LOG_FILE = os.path.join(LOG_DIR, f"{DAEMON}.log")
 SERVICE_NAME = "pretzel-ai.service"
 SERVICE_PATH = os.path.join("/etc/systemd/system", SERVICE_NAME)
 
-# Keys, out of the repo and out of the config document. The unit reads this as an EnvironmentFile
-# and src/config.py already lets the environment win over the file for every one of them, so a key
-# never has to be written into config.json — which is the direction the whole config is
-# moving anyway (the declaration goes to the appliance's running-config, the secrets do not).
-# Root-owned, 0600, created empty-but-commented by `start` and never overwritten after that.
+# Keys, out of the repo. The unit reads this as an EnvironmentFile, and it is what makes the
+# service runnable on its own — for a developer, or a benchmark run with no appliance in front of
+# it. In a deployment the keys come from the appliance's sealed store over ApplyConfig, and a
+# pushed key wins over anything here.
+#
+# The same directory holds deployment.json, the 0600 cache of the last pushed document. Both are
+# root-owned and neither is in the repo.
 ENV_DIR = "/etc/pretzel-ai"
 ENV_FILE = os.path.join(ENV_DIR, "keys.env")
+STATE_FILE = os.path.join(ENV_DIR, "deployment.json")
 
 # Where mgmtd's gRPC client dials (must match PZ_PRETZEL_AI_TARGET on the mgmtd side).
 LISTEN = "127.0.0.1:50051"

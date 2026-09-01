@@ -9,7 +9,7 @@ carries everything needed to run, and nothing that is only needed to build:
     src/          the app, with the gRPC stubs already generated (no protoc on the host)
     wheelhouse/   dependency wheels, so pip never has to reach PyPI
     sql/          schema migrations
-    requirements.txt, config.example.json
+    requirements.txt
     pretzel-ai-package  the installer (script/installer.py)
 
 The wheels are downloaded **on this host**. Wheels carrying native extensions — psycopg_binary,
@@ -33,7 +33,7 @@ NAME = "pretzel-ai-package"
 # What goes in. Anything not listed here never reaches production — dataset/, .venv/, .git/ and
 # script/ are all build- or development-side assets.
 PAYLOAD_DIRS = ("src", "sql")
-PAYLOAD_FILES = ("requirements.txt", "config.example.json")
+PAYLOAD_FILES = ("requirements.txt",)
 
 # Left out even from the directories above. Root-owned __pycache__ on a production host is a
 # nuisance later, and bytecode is regenerated on first import anyway.

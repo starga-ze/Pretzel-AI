@@ -66,8 +66,10 @@ WantedBy=multi-user.target
 ENV_TEMPLATE = """\
 # pretzel-ai keys — root only (0600). Read by the systemd unit as an EnvironmentFile.
 #
-# The environment wins over config.json (see src/config.py). Leave the keys in config.json empty
-# on a production host and put the real values here, so a leaked config document carries no keys.
+# A fallback, not the source. In a deployment the appliance pushes these over ApplyConfig from its
+# sealed store, and a pushed key wins over anything here — an env var that outranked the console
+# would mean an operator rotating a key in the UI and watching nothing happen. Fill these in only
+# to run the service without an appliance in front of it.
 PANW_AI_SEC_API_KEY=
 PZ_PORTKEY_API_KEY=
 """
@@ -205,16 +207,10 @@ def place_payload(prefix):
         shutil.copytree(src, dst)
         say(f"Placed: {dst}")
 
-    ex = os.path.join(HERE, "config.example.json")
-    cfg = os.path.join(prefix, "config.json")
-    if os.path.isfile(ex):
-        shutil.copy2(ex, os.path.join(prefix, "config.example.json"))
-        # Never overwrite an existing config.json — it holds values an operator set by hand.
-        if not os.path.isfile(cfg):
-            shutil.copy2(ex, cfg)
-            say(f"Created config.json (keys left empty): {cfg}")
-        else:
-            say("config.json already exists; leaving it untouched.")
+    # No config file is placed. There is not one any more: the deployment — vendors, models, the
+    # guardrail, the turn shape — arrives from the appliance over ApplyConfig and is cached at
+    # /etc/pretzel-ai/deployment.json. A fresh install comes up listening and mute, which is the
+    # only state it can be in before the appliance has told it anything.
 
 
 def make_venv(prefix):

@@ -246,3 +246,56 @@ class NullGuardrail:
 
     def inspect_tool_result(self, turn: Turn, call: ToolCall, output: str) -> Verdict:
         return Verdict.uninspected_by_design(Direction.TOOL_OUTPUT)
+
+
+@dataclass
+class CheckpointGate:
+    """A guardrail with some of its four checkpoints switched off.
+
+    The switches are per-checkpoint rather than one on/off for the whole guardrail because their
+    consequences differ. A skipped tool_call cannot be undone once the tool has run; a skipped
+    response only means nobody read the answer first. And an operator measuring one checkpoint —
+    tuning a profile against prompts, say — wants the other three out of the way rather than the
+    guardrail off altogether, which would take the measurement with it.
+
+    A closed checkpoint answers NOT_INSPECTED, never ALLOW. That distinction is the whole reason
+    this is a wrapper and not an `if` at each call site: the engine records a verdict for every
+    checkpoint it reaches, and a report has to be able to say "nothing looked at this" rather than
+    "this was looked at and cleared". NullGuardrail makes the same promise for all four at once;
+    this makes it for a chosen subset.
+    """
+
+    inner: Guardrail
+    prompt: bool = True
+    response: bool = True
+    tool_call: bool = True
+    tool_result: bool = True
+
+    @property
+    def describes(self) -> str:
+        off = [name for name, on in (("prompt", self.prompt), ("response", self.response),
+                                     ("tool-call", self.tool_call),
+                                     ("tool-result", self.tool_result)) if not on]
+        inner = getattr(self.inner, "describes", None) or type(self.inner).__name__
+        return f"{inner} (off: {', '.join(off)})" if off else str(inner)
+
+    def inspect_prompt(self, turn: Turn, prompt: str,
+                       context: Sequence[str] = ()) -> Verdict:
+        if not self.prompt:
+            return Verdict.uninspected_by_design(Direction.PROMPT)
+        return self.inner.inspect_prompt(turn, prompt, context)
+
+    def inspect_response(self, turn: Turn, prompt: str, response: str) -> Verdict:
+        if not self.response:
+            return Verdict.uninspected_by_design(Direction.RESPONSE)
+        return self.inner.inspect_response(turn, prompt, response)
+
+    def inspect_tool_call(self, turn: Turn, call: ToolCall) -> Verdict:
+        if not self.tool_call:
+            return Verdict.uninspected_by_design(Direction.TOOL_INPUT)
+        return self.inner.inspect_tool_call(turn, call)
+
+    def inspect_tool_result(self, turn: Turn, call: ToolCall, output: str) -> Verdict:
+        if not self.tool_result:
+            return Verdict.uninspected_by_design(Direction.TOOL_OUTPUT)
+        return self.inner.inspect_tool_result(turn, call, output)

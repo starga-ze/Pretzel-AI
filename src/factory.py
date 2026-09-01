@@ -36,7 +36,7 @@ from src.airs.client import AirsClient, AirsConfig
 from src.airs.gateway import GatewayGuardrail
 from src.airs.scan import AirsGuardrail
 from src.chat.engine import ChatEngine, ToolRuntime
-from src.guardrail import Guardrail, NullGuardrail
+from src.guardrail import CheckpointGate, Guardrail, NullGuardrail
 from src.llm.catalog import Catalog
 from src.llm.direct import DirectTransport, Endpoint
 from src.llm.portkey import PortkeyTransport
@@ -70,7 +70,7 @@ def build_engine(config: dict[str, Any], credentials, *,
         raise ConfigError(f"route.guardrail must be one of {GUARDRAILS}, got '{guardrail_kind}'")
 
     transport = _build_transport(llm_leg, gateway_cfg, config, credentials, catalog)
-    guardrail = _build_guardrail(guardrail_kind, config, route)
+    guardrail = _build_guardrail(guardrail_kind, config, route, credentials)
 
     # Deployments that cannot inspect what they route. Not refused — both are real, and one of
     # them is how most customers run today — but never silent.
@@ -101,16 +101,19 @@ def _build_transport(leg: str, gateway_cfg: dict[str, Any], config: dict[str, An
     token_param = catalog.token_param
 
     if leg == "gateway":
-        key = credentials.key(gateway_cfg.get("id", "portkey"))
+        key = credentials.key("portkey")
         if not key:
-            raise ConfigError("route.llm='gateway' but no gateway credential is configured")
-        return PortkeyTransport(_base_url(gateway_cfg), key, timeout_sec=timeout,
-                                token_param_for=token_param,
-                                extra_headers=gateway_cfg.get("headers") or {})
+            raise ConfigError("the AI gateway is selected but no gateway API key is stored")
+        return PortkeyTransport(GATEWAY_BASE_URL, key, timeout_sec=timeout,
+                                token_param_for=token_param)
 
     endpoints = {}
     for slug, raw in (config.get("providers") or {}).items():
-        key = str(raw.get("api_key", "")) or credentials.key(slug)
+        # The key comes from `credentials` and nowhere else. It used to be readable off the
+        # provider entry too, back when that entry was a block someone hand-wrote in config.json;
+        # a deployment document that carried it in two places was two places to look when the
+        # wrong one was in use.
+        key = credentials.key(slug)
         if not key:
             log.warning("provider '%s' has no key configured — models on it will fail", slug)
         endpoints[slug] = Endpoint(
@@ -130,16 +133,54 @@ def _build_transport(leg: str, gateway_cfg: dict[str, Any], config: dict[str, An
                            token_param_for=token_param, bare_model=bare)
 
 
-def _build_guardrail(kind: str, config: dict[str, Any], route: dict[str, Any]) -> Guardrail:
+def _build_guardrail(kind: str, config: dict[str, Any], route: dict[str, Any],
+                     credentials) -> Guardrail:
+    raw = config.get("airs") or {}
+    inner = _guardrail_kind(kind, raw, route, credentials)
+
+    # Nothing to gate. NullGuardrail already answers NOT_INSPECTED at all four, and wrapping it
+    # would produce a second warning saying the same thing as the one build_engine already logs.
+    if kind == "none":
+        return inner
+
+    # The four checkpoints, each its own switch. Applied to the gateway as well as to AIRS:
+    # "gateway, but do not defer the response checkpoint to it" is as real a deployment as the
+    # AIRS equivalent.
+    points = raw.get("checkpoints") or {}
+    gate = CheckpointGate(
+        inner,
+        prompt=bool(points.get("prompt", True)),
+        response=bool(points.get("response", True)),
+        tool_call=bool(points.get("tool_call", True)),
+        tool_result=bool(points.get("tool_result", True)))
+
+    # Only what an operator turned off, never what this deployment does not have. Chat has no tool
+    # checkpoints and the gateway cannot see them; warning about those would fire on every correct
+    # deployment, which is how a warning stops being read. `checkpoints_available` is set by
+    # src/deployment.py, which is where the intersection is worked out.
+    available = raw.get("checkpoints_available")
+    if available is None:
+        available = ("prompt", "response", "tool_call", "tool_result")
+    off = [n for n in available if not bool(points.get(n, True))]
+    if off:
+        # Worth a line of its own: a checkpoint that is off produces no findings, and a report
+        # that does not say which were live reads the same as one where nothing was found.
+        log.warning("guardrail checkpoints switched off: %s — turns are not inspected at %s",
+                    ", ".join(off), "those points" if len(off) > 1 else "that point")
+    return gate
+
+
+def _guardrail_kind(kind: str, raw: dict[str, Any], route: dict[str, Any],
+                    credentials) -> Guardrail:
     if kind == "none":
         return NullGuardrail()
     if kind == "gateway":
         return GatewayGuardrail(
             require_guardrail=bool(route.get("require_guardrail", False)))
 
-    raw = config.get("airs") or {}
     airs = AirsConfig(
-        api_key=str(raw.get("api_key", "")),
+        # Same rule as a vendor key: it is resolved once, into `credentials`, and read from there.
+        api_key=credentials.key("airs"),
         endpoint=str(raw.get("endpoint", "") or AirsConfig.endpoint),
         profile_name=str(raw.get("profile_name", "")),
         profile_id=str(raw.get("profile_id", "")),
@@ -151,17 +192,11 @@ def _build_guardrail(kind: str, config: dict[str, Any], route: dict[str, Any]) -
         raise ConfigError(str(exc)) from exc
 
 
-def _base_url(gateway_cfg: dict[str, Any]) -> str:
-    """The gateway's base, with the SDK-owned path suffix removed.
-
-    The config names a full completions path because that is what the operator pastes from the
-    vendor's docs; the SDK owns "/chat/completions" and wants everything before it.
-    """
-    scheme = "https" if gateway_cfg.get("tls", True) else "http"
-    host = gateway_cfg.get("host", "")
-    port = gateway_cfg.get("port", 443)
-    path = str(gateway_cfg.get("path", "/v1/chat/completions"))
-    suffix = "/chat/completions"
-    if path.endswith(suffix):
-        path = path[: -len(suffix)]
-    return f"{scheme}://{host}:{port}{path}"
+# The hosted AI gateway, compiled in for the same reason the vendors' endpoints are: which URL it
+# is, is a fact about the service rather than a setting, and a console field for it only ever bought
+# the chance to point "the gateway" at something that is not it. The SDK owns the
+# "/chat/completions" suffix and wants everything before it, which is why this stops at /v1.
+#
+# A self-hosted gateway would be a change here — it needs this transport to speak its dialect
+# anyway, and it has never been a deployment this appliance shipped for.
+GATEWAY_BASE_URL = "https://aigw.portkey.ai:443/v1"

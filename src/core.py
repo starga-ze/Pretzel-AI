@@ -18,7 +18,6 @@ from concurrent import futures
 
 import grpc
 
-from src import config as pa_config
 from src.benchmark import store as benchmark_store
 from src.deployment import Deployment
 from src.grpc import pretzel_ai_pb2_grpc
@@ -32,21 +31,20 @@ log = logging.getLogger("pretzel-ai")
 MAX_WORKERS = 8
 
 
-def build(config_path):
+def build():
     """→ (server, deployment). Bound and populated, not yet started.
 
-    The whole deployment matrix is decided in one call here: Deployment merges config.json with
-    whatever the appliance last pushed and builds an engine already holding the transport and the
-    guardrail that combination chose. Nothing downstream of this line — not the servicer, not a
+    The whole deployment matrix is decided in one call here: Deployment lays whatever the appliance
+    last pushed over the built-in defaults and builds an engine already holding the transport and
+    the guardrail that combination chose. Nothing downstream of this line — not the servicer, not a
     handler — can tell which combination it got, which is the point of the indirection and the
-    reason moving inspection to or from a gateway is a config edit.
+    reason moving inspection to or from a gateway is a console edit.
 
     The deployment, not the engine, is what the servicer is handed: ApplyConfig replaces the engine
     while the service runs, and a servicer holding the engine directly would keep serving the one
     it was built with.
     """
-    config, credentials = pa_config.load(config_path)
-    deployment = Deployment(config, credentials, config_path)
+    deployment = Deployment()
 
     # An upload carries a whole .jsonl in one message and the store accepts up to 32 MB, which is
     # past gRPC's 4 MB default — without this the large-file case fails at the transport with a
@@ -63,9 +61,9 @@ def build(config_path):
     return server, deployment
 
 
-def serve(address, config_path):
+def serve(address):
     """Start on `address` and block until the process is told to stop."""
-    server, deployment = build(config_path)
+    server, deployment = build()
 
     # Loopback, no TLS — this is the mgmtd↔pretzel-ai edge, not the gateway edge.
     server.add_insecure_port(address)
@@ -86,8 +84,8 @@ def serve(address, config_path):
         log.info("route: %s", engine.describes)
         log.info("models: %d (default %s)", len(engine.catalog), engine.catalog.default or "none")
 
-    # Which configuration this is. 0 means the appliance has never pushed one and this is
-    # config.json alone — a real state on a fresh install, and one worth being able to see.
+    # Which configuration this is. 0 means the appliance has never pushed one and this is the
+    # built-in defaults alone — a real state on a fresh install, and one worth being able to see.
     log.info("deployment: running-config version %s", deployment.version or "none pushed yet")
 
     server.wait_for_termination()

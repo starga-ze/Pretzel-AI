@@ -24,37 +24,50 @@ The daemon runs as `pretzel-ai.service` and logs to a rotating file:
 tail -f /var/log/pretzel-ai/pretzel-ai.log
 ```
 
-## The AIRS gateway
+## Configuration
 
-All gateway settings live in **`config.json`** at the repo root — host, port, scheme (`tls`), path,
-header names, model list, system prompt, and the key in `api_key`. See `src/config.py`.
+There is **no config file.** The whole deployment — which vendors serve turns, which of their
+models may be asked for, the guardrail, and how a turn is shaped — is committed in the appliance's
+console, versioned in its running-config, and pushed here over `ApplyConfig`. This service reads no
+database and holds no file of record; it applies what it is told and caches the last document at
+`/etc/pretzel-ai/deployment.json` (root, 0600) so a restart does not leave it mute until the next
+push.
 
-That file holds a secret, so it is **not** in the repo. Start from the template:
+Before the first push a fresh install comes up **listening and mute** — no models, so no turn can
+be served — and says so in the log. That is the only state it can be in before the appliance has
+told it anything, and it is why a configuration that cannot serve is not fatal at startup: the
+thing that would fix it reaches this service over the wire.
 
-```bash
-cp config.example.json config.json
-```
+What arrives, and where it came from:
 
-then either fill in `api_key` or leave it empty and export `PZ_PORTKEY_API_KEY`.
+| pushed | running-config | notes |
+|---|---|---|
+| providers, models | `pretzel-ai.providers.list` | endpoints are compiled in here, not configured |
+| guardrail kind, AIRS endpoint, profile, timeout, fail-open | `pretzel-ai.guardrail` | |
+| the four checkpoints | `pretzel-ai.guardrail.inspect_*` | prompt · response · tool_call · tool_result |
+| system prompt, token cap, timeout | `pretzel-ai.shape` | |
+| vendor keys, the AIRS key | *not* in running-config | sealed in `ai_provider_credential_state`, unsealed by mgmtd for the push |
 
-Overrides:
+The guardrail used to live in this service's own `config.json`, deliberately, so that an appliance
+changing which models it serves could not change whether the turns were inspected. That bought its
+protection by making the guardrail unconfigurable without editing a file on the appliance and
+restarting the service. The console owns it now; what protects it is that every change is a
+committed, versioned running-config edit rendered in a review diff.
 
-- `PZ_PORTKEY_API_KEY` — takes precedence over the `api_key` in config.json, so a deploy need not
-  edit the file
-- `PZ_<SLUG>_API_KEY` — one per direct provider, named after its routing slug
-  (`@openai/gpt-4o-…` → `PZ_OPENAI_API_KEY`). Same precedence: the environment wins over the file
+### Running without an appliance
+
+For a developer or a benchmark run with nothing in front of this service, keys come from the
+environment — `/etc/pretzel-ai/keys.env` (root, 0600) under systemd, which `./pretzel-ai start`
+creates with a commented template on first run and never rewrites:
+
+- `PZ_<SLUG>_API_KEY` — one per provider slug (`openai/gpt-…` → `PZ_OPENAI_API_KEY`)
 - `PANW_AI_SEC_API_KEY` — the Prisma AIRS scan key
-- `PZ_PRETZEL_AI_GATEWAY_HOST` — gateway host, if not where config.json points
-- `PZ_PRETZEL_AI_CONFIG` — alternate config path
+- `PZ_PRETZEL_AI_STATE` — where the pushed document is cached, if not `/etc/pretzel-ai/deployment.json`
 
-Under systemd those come from **`/etc/pretzel-ai/keys.env`** (root, 0600), which `./pretzel-ai
-start` creates with a commented template on first run and never rewrites afterwards. The unit reads
-it as an `EnvironmentFile`, so a key never has to be written into `config.json` — which matters
-because the configuration document is on its way into the appliance's versioned running-config,
-where a secret would be permanent and visible in every review diff.
-
-The gateway itself must be deployed separately; until it is up on the configured host:port, turns
-return `UNREACHABLE`.
+A **pushed key wins over the environment.** It used to be the other way round, because the
+environment was how a key avoided being written into the config document; there is no such document
+now, and an env var that outranked the console would mean an operator rotating a key in the UI and
+watching nothing happen.
 
 ## Layout
 
@@ -64,7 +77,7 @@ script/                          build / install / start / stop / clean
 src/grpc/pretzel_ai.proto        the mgmtd <-> pretzel-ai contract (source of truth,
                                  mirrored into pretzel/mgmtd/grpc/)
 src/main.py                      the entry point: args and log level, then core.serve
-src/core.py                      the service: config -> engine -> gRPC server -> run
+src/core.py                      the service: deployment -> engine -> gRPC server -> run
 src/factory.py                   which transport and which guardrail this deployment runs
 src/guardrail.py                 what an inspection says, with no vendor in the vocabulary
 src/airs/                        Prisma AIRS: the scan API client, and both guardrail shapes
@@ -72,11 +85,11 @@ src/llm/                         the model call: gateway transport, direct trans
 src/chat/                        the turn: enforcement order, the agent loop, console adapter
 src/grpc/server.py               the servicer, composed from src/grpc/handlers/
 src/gateway.py                   the AIRS gateway call + scan-verdict extraction
-src/config.py                    loads config.json → the appliance config
+src/config.py                    the built-in defaults, and keys from the environment
+src/deployment.py                the pushed document laid over them, and the engine it builds
 src/log.py                       rotating file log at /var/log/pretzel-ai
 src/crawler/                     the tech-doc crawler (sitemap → fetch → extract → store)
 sql/001_techdoc.sql              the pretzel_knowledge schema
-config.example.json              template for the config (copy to config.json)
 ```
 
 `src/grpc/` holds everything gRPC — the contract, the stubs `build` generates beside it, and the
