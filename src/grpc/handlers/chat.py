@@ -14,16 +14,22 @@ anyway. Scanning the finished answer and then re-streaming it is the honest comp
 import json
 import logging
 
-from src.chat.console import to_document
+from src.completion import Message, Role
+from src.deployment.config import CHAT
+from src.engine import Turn
+from src.engine.console import to_document
 from src.grpc import pretzel_ai_pb2
-from src.guardrail import Turn
-from src.llm.transport import Message, Role
 
 log = logging.getLogger("pretzel-ai")
 
 # Values in the request dump are capped; fields never are. A 32 KiB turn would otherwise bury
 # the surrounding log, and the cut is marked so a truncated value is never read as the whole.
 _DUMP_CAP = 2048
+
+# `message` is whatever a person typed and has no ceiling — a pasted log arrives here as easily as
+# a sentence. Twenty bytes is enough to tell one turn from another in a log and not enough to be
+# worth reading, which is the point: the size says how big it was, the console shows what it said.
+_MESSAGE_CAP = 20
 
 # What a turn gets when there is no engine to run it. Reached on a fresh install, before the
 # appliance has pushed a deployment, and after a push that was refused left nothing behind — see
@@ -38,13 +44,19 @@ def _chunks(text):
     token = ""
     for ch in text:
         token += ch
+        # The break goes WITH the word it follows, so joining every chunk back together gives the
+        # original string byte for byte. The console relies on that: what it renders has to equal
+        # result_json["reply"].
         if ch.isspace():
             yield token
             token = ""
+
+    # Whatever is left after the last space. A reply not ending in whitespace would otherwise lose
+    # its final word.
     if token:
         yield token
 
-def _dump_value(v):
+def _dump_value(v, cap=_DUMP_CAP):
     """Values are capped; fields are not. The cut is marked so a truncated value is never read
     as the whole of it.
 
@@ -54,19 +66,49 @@ def _dump_value(v):
     """
     if not v:
         return '"" (empty)'
-    n = len(v.encode("utf-8"))
-    body = v[:_DUMP_CAP] + '" \u2026truncated' if n > _DUMP_CAP else v + '"'
-    return f'({n} bytes) "{body}'
+
+    raw = v.encode("utf-8")
+    n = len(raw)
+
+    if n <= cap:
+        return f'({n} bytes) "{v}"'
+
+    # Cut in BYTES and decoded loosely. The cap is a byte count, so slicing characters would
+    # overshoot it threefold on Korean - and a cut landing mid-character decodes to nothing rather
+    # than raising, which is what "ignore" is for.
+    return f'({n} bytes) "{raw[:cap].decode("utf-8", "ignore")}\u2026"'
+
+
+def _dump_size(v):
+    """The size and nothing else, for a field whose length is what a reader needs.
+
+    History is the whole conversation replayed on every turn, so a dump that printed it grew with
+    the thread — one turn carrying six earlier ones buried the fields around it under thousands of
+    bytes nobody was reading. What the reader is checking here is the SHAPE: how many turns
+    arrived, in which order, and how big each is. The text is what the console already shows.
+    """
+    if not v:
+        return '"" (empty)'
+    return f'({len(v.encode("utf-8"))} bytes)'
 
 def dump_chat_request(request):
-    lines = ["", "  \u250c\u2500 ChatRequest \u2190 mgmtd " + "\u2500" * 42]
+    """The request as it arrived, by shape rather than by content.
+
+    Titled for the path it came down rather than for the message type alone: what a reader is
+    placing is which hop produced this, and "ChatRequest" on its own does not say.
+    """
+    lines = ["", "mgmtd -> grpc -> ChatRequest"]
     for name in ("model", "message", "system_prompt", "session_id", "transaction_id"):
-        lines.append(f"  \u2502 {name:<15} {_dump_value(getattr(request, name))}")
-    lines.append(f"  \u2502 history         {len(request.history)} turn(s)")
+        if name == "message":
+            cap = _MESSAGE_CAP
+        else:
+            cap = _DUMP_CAP
+        lines.append(f"  {name:<15} {_dump_value(getattr(request, name), cap)}")
+    lines.append(f"  history         {len(request.history)} turn(s)")
     for i, t in enumerate(request.history):
-        lines.append(f"  \u2502   [{i}] role    {_dump_value(t.role)}")
-        lines.append(f"  \u2502       content {_dump_value(t.content)}")
-    lines.append("  \u2514" + "\u2500" * 68)
+        lines.append(f"    [{i}] role    {_dump_value(t.role)}")
+        # Size only. Deliberately not _dump_value: see _dump_size.
+        lines.append(f"        content {_dump_size(t.content)}")
     return "\n".join(lines)
 
 class ChatHandlers:
@@ -78,47 +120,52 @@ class ChatHandlers:
     """
 
     def Chat(self, request, context):
-        log.info(
-            "Chat turn from %s: model=%s system_prompt=%s message_chars=%d history=%d "
-            "session=%s txn=%s",
-            context.peer(),
-            request.model or "(default)",
-            "set" if request.system_prompt else "none",
-            len(request.message),
-            len(request.history),
-            request.session_id or "(none)",
-            request.transaction_id or "(none)",
-        )
-
         # DEBUG on purpose, and it stays there: `message` and `history` are whatever a person
         # typed, and the INFO line above deliberately reports only their sizes. Reading this is a
         # decision to read employee text, so it takes a decision to switch on.
         log.debug("%s", dump_chat_request(request))
 
-        # An unknown role is dropped rather than coerced to "user": a mislabelled assistant turn
-        # replayed as the person's own words rewrites what the model believes it already said.
-        history = [Message(role=Role(t.role), content=t.content)
-                   for t in request.history
-                   if t.role in ("user", "assistant") and t.content]
+        # The conversation so far, as the engine's own type. Filtered rather than trusted: this is
+        # the wire boundary, and what arrives here was assembled by a browser.
+        history = []
+        for entry in request.history:
+            if entry.role not in ("user", "assistant"):
+                continue
 
-        # The three ids the appliance traces a scan by. tr_id is NOT set here — the engine mints
-        # one per model call, and with tools there is more than one of those in a single request.
+            if not entry.content:
+                continue
+
+            history.append(Message(role=Role(entry.role), content=entry.content))
+
+        # The two ids the appliance traces a scan by, both of them minted elsewhere: the browser
+        # names the conversation and mgmtd names the request. The engine fills `transaction_id`
+        # only if it arrives empty — see engine.new_transaction_id for why there is no third id.
         turn = Turn(session_id=request.session_id,
                     transaction_id=request.transaction_id,
                     app_user=_peer_user(context))
 
         # Where this actually goes — gateway or straight to the provider, inspected by AIRS or by
         # the gateway's inline hook or by nothing — was decided once at startup, in
-        # factory.build_engine. This handler cannot tell and must not try: a branch here would be
+        # deployment.guardrail.build. This handler cannot tell and must not try: a branch here would be
         # a second place the deployment matrix is decided, and the two would drift.
-        if self._engine is None:
+        engine = self.get_engine(CHAT)
+        if engine is None:
             yield pretzel_ai_pb2.ChatChunk(done=True, error=_UNCONFIGURED)
             return
 
-        result = self._engine.run(
+        # proto3 cannot tell "not sent" from "sent empty", so an empty string is read as the
+        # first: the caller said nothing about the system prompt and this service's own stands.
+        # A caller that wants NO system prompt has to reach the engine another way - see
+        # Engine._opening_messages, which treats None and "" as different answers.
+        if request.system_prompt:
+            system_prompt = request.system_prompt
+        else:
+            system_prompt = None
+
+        result = engine.run(
             request.message,
             model=request.model,
-            system_prompt=request.system_prompt or None,
+            system_prompt=system_prompt,
             history=history,
             turn=turn)
 
@@ -132,28 +179,36 @@ class ChatHandlers:
             for piece in _chunks(result.reply):
                 yield pretzel_ai_pb2.ChatChunk(delta=piece, done=False)
 
+        if result.ok:
+            error = ""
+        else:
+            error = result.error
+
         yield pretzel_ai_pb2.ChatChunk(
             done=True,
-            error="" if result.ok else result.error,
+            error=error,
             result_json=json.dumps(document, ensure_ascii=False),
         )
 
     def ListModels(self, request, context):
         """The picker's catalog. Unary and cheap — it is read once per page load."""
-        if self._engine is None:
+        engine = self.get_engine(CHAT)
+        if engine is None:
             return pretzel_ai_pb2.ModelList(error=_UNCONFIGURED)
 
         try:
-            catalog = self._engine.catalog
+            catalog = engine.catalog
             models = catalog.as_list()
         except Exception as exc:                    # noqa: BLE001 - reported to the console
             log.exception("ListModels failed")
             return pretzel_ai_pb2.ModelList(error=str(exc))
 
         log.debug("ListModels from %s: %d models", context.peer(), len(models))
-        return pretzel_ai_pb2.ModelList(
-            models=[pretzel_ai_pb2.Model(**m) for m in models],
-            default_model=catalog.default)
+        listed = []
+        for entry in models:
+            listed.append(pretzel_ai_pb2.Model(**entry))
+
+        return pretzel_ai_pb2.ModelList(models=listed, default_model=catalog.default)
 
 
 def _peer_user(context) -> str:
@@ -164,4 +219,7 @@ def _peer_user(context) -> str:
     username, this is the one line that changes — and until then the scan logs should say plainly
     that the appliance, not a person, is what they identified.
     """
-    return context.peer() or "pretzel-ai"
+    peer = context.peer()
+    if peer:
+        return peer
+    return "pretzel-ai"

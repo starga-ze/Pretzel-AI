@@ -43,7 +43,7 @@ class Model:
     def slug(self) -> str:
         """The routing slug, or "" for a bare model name.
 
-        Two spellings, one meaning. "@openai/gpt-4o" is Portkey's, and a config.json written for a
+        Two spellings, one meaning. "@openai/gpt-4o" is the gateway's, and a config.json written for a
         gateway still uses it; "openai/gpt-4o" is the appliance's, which has no gateway in it and
         no reason to carry a gateway's punctuation. The "@" is stripped rather than required so
         both reach the same endpoint.
@@ -87,7 +87,15 @@ class Catalog:
                                  "provider": PROVIDER_LABELS.get(model.slug, model.slug)})
             self._models[model_id] = model
 
-        self._default = default if default in self._models else next(iter(self._models), "")
+        # The named default, when it is one of the models that actually arrived. A configuration
+        # can name a model the providers no longer carry, and opening on nothing would refuse every
+        # turn that did not name one itself - so the catalog falls back to whatever it holds first.
+        if default in self._models:
+            self._default = default
+        elif self._models:
+            self._default = next(iter(self._models))
+        else:
+            self._default = ""
 
     def __len__(self) -> int:
         return len(self._models)

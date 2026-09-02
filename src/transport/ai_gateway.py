@@ -1,7 +1,11 @@
-"""The LLM leg through the Portkey AI gateway.
+"""The LLM leg through the AI Gateway.
 
-Uses the vendor SDK rather than hand-rolled HTTP. Not because the call is hard — it is one JSON
-POST — but because a customer deployment is easier to reason about when the appliance is running
+The other implementation of the same job direct.py does, and chosen the same way: by name, in
+deployment/transport.py. Nothing here reads which guardrail was configured, and nothing in
+guardrail/ reads which leg this is.
+
+Uses the gateway's own SDK rather than hand-rolled HTTP. Not because the call is hard - it is one JSON
+POST - but because a customer deployment is easier to reason about when the appliance is running
 the vendor's own client, with their retry and timeout defaults and their docs.
 
 Two behaviours of that SDK are load-bearing here and were verified before depending on them:
@@ -9,11 +13,9 @@ Two behaviours of that SDK are load-bearing here and were verified before depend
   * a successful turn keeps `hook_results` on the response, so an inline guardrail verdict
     survives `model_dump()`;
   * a guardrail block arrives as an exception, and the hook results survive on
-    `exc.response.json()` — NOT on `exc.body`, which carries only the error message.
+    `exc.response.json()` - NOT on `exc.body`, which carries only the error message.
 
-That second one is the whole reason this file catches by shape rather than by class. Reading the
-verdict off the exception is what keeps "was this turn inspected" separate from "did this turn
-succeed"; losing it would turn a guardrail block into a generic upstream error.
+That second one is the whole reason this file catches by shape rather than by class.
 """
 
 from __future__ import annotations
@@ -22,19 +24,19 @@ import logging
 import time
 from typing import Any, Sequence
 
+# The vendor's package and its client class still carry the pre-acquisition name, and so does the
+# trace header further down. Those are wire and dependency facts - renaming them here would just
+# mean importing something that does not exist - so this file speaks "AI Gateway" everywhere the
+# name is ours to choose, and Portkey only where it is not.
 from portkey_ai import Portkey
 
-from src.llm.transport import (
-    Completion, LlmTransport, Message, ToolSpec, build_body, parse_choice,
-)
+from src.completion import Completion, Message
+from src.completion.wire import build_body, parse_choice
 
-log = logging.getLogger("pretzel-ai.llm")
-
-# The gateway answers a guardrail denial with this, which is not in anyone's HTTP registry.
-GUARDRAIL_STATUS = 446
+log = logging.getLogger("pretzel-ai.transport.ai_gateway")
 
 
-class PortkeyTransport:
+class AiGatewayTransport:
     """Implements src.llm.transport.LlmTransport against an AI gateway."""
 
     def __init__(self, base_url: str, api_key: str, *, timeout_sec: float = 45.0,
@@ -52,9 +54,8 @@ class PortkeyTransport:
         return f"gateway {self._base_url}"
 
     def complete(self, model: str, messages: Sequence[Message], *,
-                 tools: Sequence[ToolSpec] = (), tool_choice: str = "auto",
                  max_tokens: int = 4096, trace_id: str = "") -> Completion:
-        body = build_body(model, messages, tools=tools, tool_choice=tool_choice,
+        body = build_body(model, messages,
                           token_param=self._token_param_for(model), max_tokens=max_tokens)
         # The SDK takes model and messages as named arguments and everything else through
         # extra_body, so they come back out of the body we just built.
@@ -66,6 +67,7 @@ class PortkeyTransport:
             # Forwarded to Prisma AIRS as the scan's tr_id. It is the only id the gateway's hook
             # sets, which is why the appliance's own three-level scheme only lands fully on the
             # direct scan path.
+            # The gateway's own header name, kept as the gateway spells it.
             headers["x-portkey-trace-id"] = trace_id
 
         started = time.monotonic()
@@ -75,9 +77,10 @@ class PortkeyTransport:
                 extra_headers=headers or None, timeout=self._timeout)
             doc = response.model_dump()
             status = 200
-        except Exception as exc:                    # noqa: BLE001 - classified by shape below
+        except Exception as exc:                    
+            # noqa: BLE001 - classified by shape below
             # Not caught by class: the SDK raises openai.APIStatusError, and `openai` is vendored
-            # inside portkey_ai and not importable here. Naming it would mean reaching into a
+            # inside the gateway SDK and not importable here. Naming it would mean reaching into a
             # private path a version bump can move. The shape is stable — an HTTP failure carries
             # a response we can read, a transport failure does not.
             doc, status, transport_error = _classify(exc)
@@ -127,14 +130,14 @@ def _to_completion(doc: dict[str, Any], status: int, latency_ms: int, model: str
                           model=model, raw=doc,
                           error=error_msg or "the provider returned an error")
 
-    text, calls, finish = parse_choice(doc)
-    if not text and not calls:
+    text, finish = parse_choice(doc)
+    if not text:
         return Completion(ok=False, code="BAD_RESPONSE", status=status, latency_ms=latency_ms,
                           model=model, raw=doc,
                           error="gateway response carried no completion")
 
     usage = doc.get("usage") if isinstance(doc.get("usage"), dict) else {}
-    return Completion(ok=True, text=text, tool_calls=calls, finish_reason=finish,
+    return Completion(ok=True, text=text, finish_reason=finish,
                       usage=usage, status=status, latency_ms=latency_ms,
                       model=str(doc.get("model") or model), raw=doc)
 

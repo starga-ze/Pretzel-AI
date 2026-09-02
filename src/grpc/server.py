@@ -39,17 +39,47 @@ class PretzelAiServicer(
     UNIMPLEMENTED rather than AttributeError.
     """
 
-    def __init__(self, deployment):
-        # The deployment owns the engine and can replace it: ApplyConfig arrives while the service
-        # is running, so what a handler must not do is capture the engine once. It reads
-        # `self._engine` per call, which is a property onto whatever the deployment currently
-        # holds — a turn already in flight keeps the one it started on.
+    def __init__(self, core):
+        # The servicer holds Core, not an engine. ApplyConfig replaces the engines while the
+        # daemon runs, so a handler that captured one would keep serving the configuration it
+        # started with. Every handler asks per call.
+        #
+        # Core rather than Services for the same reason one level up: applying a configuration
+        # replaces the whole Services object, and a servicer holding the old one would hand out
+        # old engines. A turn already in flight keeps the engine it started on.
         #
         # The engine holds the transport and the guardrail that configuration selected. Handlers
         # take it as given: none of them may ask which route this appliance is running, because a
         # handler that branched on it would be a second place the matrix is decided.
-        self._deployment = deployment
+        self._core = core
 
-    @property
-    def _engine(self):
-        return self._deployment.engine
+    def get_engine(self, service_type):
+        """The engine that serves this service's turns, or None when it has none.
+
+        None is a state, not a failure: a fresh install has no configuration until the appliance
+        pushes one, and a handler answers with the reason rather than crashing. Read per call,
+        never cached.
+
+        There is no `current_engine` any more, and the name is why: with chat and agent configured
+        apart there is no single current one, so the caller names the service it is serving -
+        ServiceType.CHAT or ServiceType.AGENT, never a bare string a typo could slip through.
+        """
+        services = self._core.services
+        if services is None:
+            return None
+        return services.get_engine(service_type)
+
+    def apply_config(self, config) -> None:
+        """Adopt a pushed configuration. Raises when it cannot produce engines."""
+        self._core.apply_config(config)
+
+    def describe_service(self, service_type) -> str:
+        """One line for the log, whether or not the service is ready."""
+        services = self._core.services
+        if services is None:
+            return "not configured"
+
+        service = services.get_service(service_type)
+        if service is None:
+            return "unknown service"
+        return service.describe()

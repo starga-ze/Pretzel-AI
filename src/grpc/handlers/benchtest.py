@@ -6,6 +6,7 @@ import time
 import grpc
 
 from src.benchmark import runner as benchmark_runner, store as benchmark_store
+from src.deployment.config import CHAT
 from src.grpc import pretzel_ai_pb2
 
 log = logging.getLogger("pretzel-ai")
@@ -82,7 +83,7 @@ class BenchtestHandlers:
                 filters={"category": request.category, "verdict": request.verdict,
                          "language": request.language, "technique": request.technique},
                 search=request.search, workers=request.workers, label=request.label,
-                note=request.note, engine=self._deployment.engine)
+                note=request.note, engine=self.get_engine(CHAT))
             for update in generator:
                 if not context.is_active():
                     break

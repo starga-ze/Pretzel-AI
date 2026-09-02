@@ -1,14 +1,18 @@
-"""The LLM leg straight to the provider, with no gateway in the path.
+"""The provider endpoint, and the HTTP round trip to it.
 
-This is how customers run the appliance today when they have not deployed a gateway, and it is the
-shape the guardrail work has to account for: nothing inspects a turn on this path unless the
-appliance inspects it. A completion here carries no `hook_results`, and the code that reads one
-must not treat their absence as a clean scan — src/guardrail.py's NOT_INSPECTED exists for exactly
-this deployment.
+Straight to the vendor, with no gateway in the path. This is how the appliance runs today, and
+it is the shape the guardrail work has to account for: nothing inspects a turn on this path
+unless the appliance inspects it. A completion here carries no gateway hook results, and the
+code that reads one must not treat their absence as a clean scan.
 
-urllib rather than a vendor SDK: there is no one vendor here. The endpoint, the header a key goes
-in, and the prefix it takes are per-provider config, and every provider worth pointing at publishes
-an OpenAI-compatible chat-completions endpoint. One code path, described by data.
+urllib rather than a vendor SDK: there is no one vendor here. The endpoint, the header a key
+goes in, and the prefix it takes are per-provider config, and every provider worth pointing at
+publishes an OpenAI-compatible chat-completions endpoint. One code path, described by data.
+
+The call is synchronous and blocking, deliberately. Streaming is off in wire.build_body because
+a response-side checkpoint has to see a whole answer before any of it is shown - so a turn
+holds its gRPC worker for the length of the round trip, and the console is sent a finished
+answer that the handler re-streams.
 """
 
 from __future__ import annotations
@@ -21,11 +25,29 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from src.llm.transport import (
-    Completion, LlmTransport, Message, ToolSpec, build_body, parse_choice,
-)
+from src.completion import Completion, Message
+from src.completion.wire import build_body, parse_choice
 
-log = logging.getLogger("pretzel-ai.llm")
+log = logging.getLogger("pretzel-ai.transport.direct")
+
+
+def _default_token_param(model: str) -> str:
+    """What a model wants its output cap called, when nothing said otherwise.
+
+    The old name, because it is the one every provider still accepts. The gpt-5 generation rejects
+    it and wants `max_completion_tokens`, which is why this is a fallback and not a constant - the
+    catalog carries the real answer per model.
+    """
+    return "max_tokens"
+
+
+def _strip_routing_slug(model: str) -> str:
+    """"openai/gpt-4o" -> "gpt-4o". The provider has never heard of the slug.
+
+    A blunter rule than the catalog's, which knows which spellings name the same model. Used only
+    when no catalog was handed in.
+    """
+    return model.split("/", 1)[-1]
 
 USER_AGENT = "pz-pretzel-ai/1.0"
 
@@ -55,10 +77,18 @@ class DirectTransport:
                  token_param_for=None, bare_model=None) -> None:
         self._endpoints = dict(endpoints)
         self._timeout = timeout_sec
-        self._token_param_for = token_param_for or (lambda _model: "max_tokens")
-        # The routing slug is the gateway's syntax; a provider's own API wants the model name
-        # alone. The catalog knows how to strip it, so it is injected rather than re-derived.
-        self._bare_model = bare_model or (lambda model: model.split("/", 1)[-1])
+
+        # Both are injected because the CATALOG knows them, not this file: which parameter a model
+        # wants its token cap under, and which spellings name the same model. The fallbacks below
+        # are for a transport built without one - a probe, or a test - and are named rather than
+        # written inline so a stack trace says which one ran.
+        if token_param_for is None:
+            token_param_for = _default_token_param
+        self._token_param_for = token_param_for
+
+        if bare_model is None:
+            bare_model = _strip_routing_slug
+        self._bare_model = bare_model
 
     @property
     def describes(self) -> str:
@@ -83,13 +113,12 @@ class DirectTransport:
         return endpoint, ""
 
     def complete(self, model: str, messages: Sequence[Message], *,
-                 tools: Sequence[ToolSpec] = (), tool_choice: str = "auto",
                  max_tokens: int = 4096, trace_id: str = "") -> Completion:
         endpoint, error = self.endpoint_for(model)
         if endpoint is None:
             return Completion(ok=False, code="BAD_ROUTE", error=error, model=model)
 
-        body = build_body(model, messages, tools=tools, tool_choice=tool_choice,
+        body = build_body(model, messages,
                           token_param=self._token_param_for(model), max_tokens=max_tokens)
         # The provider has never heard of the routing slug.
         body["model"] = self._bare_model(model)
@@ -99,6 +128,7 @@ class DirectTransport:
                    "User-Agent": USER_AGENT,
                    **endpoint.auth()}
 
+        """ POST """
         started = time.monotonic()
         status, doc, transport_error = self._post(endpoint.url, body, headers)
         latency_ms = int((time.monotonic() - started) * 1000)
@@ -123,11 +153,30 @@ class DirectTransport:
 
 
 def _parse(raw: bytes) -> dict[str, Any]:
+    """The provider's document. `__raw__` when it was not one this code can read.
+
+    Gemini's OpenAI-compatible endpoint answers an ERROR as a one-element JSON ARRAY -
+    [{"error": {"code": 503, "message": "This model is currently experiencing high demand",
+    "status": "UNAVAILABLE"}}] - while a success is a plain object. Measured 2026-09-02 on a
+    live 503. Unwrapped here rather than in _to_completion because it is a fact about the
+    envelope, not about what the envelope said: left wrapped, a busy model is reported to the
+    operator as "provider response was not JSON", which sends them looking for a parse bug
+    instead of retrying.
+    """
     try:
         doc = json.loads(raw.decode("utf-8", "replace"))
     except json.JSONDecodeError:
         return {"__raw__": raw.decode("utf-8", "replace")[:400]}
-    return doc if isinstance(doc, dict) else {"__raw__": str(doc)[:400]}
+
+    if isinstance(doc, list) and len(doc) == 1 and isinstance(doc[0], dict):
+        return doc[0]
+
+    if isinstance(doc, dict):
+        return doc
+
+    # Valid JSON, but not a shape this code can read. Kept as text so the error says what actually
+    # came back rather than that something was missing from it.
+    return {"__raw__": str(doc)[:400]}
 
 
 def _to_completion(doc: dict[str, Any], status: int, latency_ms: int, model: str) -> Completion:
@@ -142,12 +191,12 @@ def _to_completion(doc: dict[str, Any], status: int, latency_ms: int, model: str
         return Completion(ok=False, code="UPSTREAM_ERROR", status=status, latency_ms=latency_ms,
                           model=model, raw=doc, error=message)
 
-    text, calls, finish = parse_choice(doc)
-    if not text and not calls:
+    text, finish = parse_choice(doc)
+    if not text:
         return Completion(ok=False, code="BAD_RESPONSE", status=status, latency_ms=latency_ms,
                           model=model, raw=doc, error="provider response carried no completion")
 
     usage = doc.get("usage") if isinstance(doc.get("usage"), dict) else {}
-    return Completion(ok=True, text=text, tool_calls=calls, finish_reason=finish,
+    return Completion(ok=True, text=text, finish_reason=finish,
                       usage=usage, status=status, latency_ms=latency_ms,
                       model=str(doc.get("model") or model), raw=doc)

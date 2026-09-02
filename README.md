@@ -79,12 +79,14 @@ src/grpc/pretzel_ai.proto        the mgmtd <-> pretzel-ai contract (source of tr
 src/main.py                      the entry point: args and log level, then core.serve
 src/core.py                      the service: deployment -> engine -> gRPC server -> run
 src/factory.py                   which transport and which guardrail this deployment runs
-src/guardrail.py                 what an inspection says, with no vendor in the vocabulary
-src/airs/                        Prisma AIRS: the scan API client, and both guardrail shapes
+src/guardrail/                   what an inspection says, and everything that says it
+  __init__.py                    the vocabulary: Decision, Verdict, Turn, ToolCall, Guardrail
+  gate.py                        NullGuardrail, CheckpointGate
+  airs.py / airs_client.py       Prisma AIRS: the guardrail, and the scan API client
+  gateway.py                     the AI gateway's inline hook, read rather than called
 src/llm/                         the model call: gateway transport, direct transport, catalog
 src/chat/                        the turn: enforcement order, the agent loop, console adapter
 src/grpc/server.py               the servicer, composed from src/grpc/handlers/
-src/gateway.py                   the AIRS gateway call + scan-verdict extraction
 src/config.py                    the built-in defaults, and keys from the environment
 src/deployment.py                the pushed document laid over them, and the engine it builds
 src/log.py                       rotating file log at /var/log/pretzel-ai

@@ -24,8 +24,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.chat.engine import ChatEngine, TurnResult, new_tr_id
-from src.guardrail import Decision, Direction, Turn, Verdict
+from src.engine import Turn, TurnResult
+from src.engine.chat import ChatEngine
+
+# The Verdict vocabulary is not imported. No guardrail is built, so a run produces no verdicts
+# at all, and the fold below reads whatever it is handed through getattr - which is what lets
+# this file keep working through the absence instead of being deleted with it. When the
+# guardrail comes back, these become real imports again and the getattrs become attribute
+# access.
 
 log = logging.getLogger("pretzel-ai.benchmark")
 
@@ -84,11 +90,10 @@ class EngineCaller:
 
     def __call__(self, case: tuple[dict[str, Any], int]) -> dict[str, Any]:
         row, run_id = case
-        # One tr_id per case, and the run and prompt in it: a scan an operator asks about later is
+        # The run and the prompt in the transaction id: a scan an operator asks about later is
         # findable by the name of the run that produced it.
         turn = Turn(session_id=f"bench-{run_id}",
                     transaction_id=f"bench-{run_id}-{row['prompt_id']}",
-                    tr_id=new_tr_id(),
                     app_name="pretzel-ai-benchtest",
                     app_user="benchtest")
 
@@ -101,12 +106,22 @@ class EngineCaller:
     # ── The two shapes a case can take ───────────────────────────────────────────────────
 
     def _scan_prompt(self, row: dict[str, Any], turn: Turn) -> CaseResult:
-        """Prompt-direction: ask the guardrail, never the model."""
+        """Prompt-direction: ask the guardrail, never the model.
+
+        With no inspector built there is nobody to ask, and this is reported as
+        `not_inspected` rather than answered. Scoring already treats that as its own outcome,
+        so a run made now reads as "nothing looked" rather than as a guardrail that let
+        everything through.
+        """
         started = time.monotonic()
-        verdict = self._engine.guardrail.inspect_prompt(turn, row["prompt"])
+        guardrail = self._engine.guardrail
+        if guardrail is None:
+            verdicts = []
+        else:
+            verdicts = [guardrail.inspect_prompt(turn, row["prompt"])]
         latency = int((time.monotonic() - started) * 1000)
 
-        result = _from_verdicts([verdict], latency)
+        result = _from_verdicts(verdicts, latency)
         result.raw_request = {"scan_target": "prompt", "prompt": row["prompt"]}
         result.completed = False        # no model was asked, and none was needed
         return result
@@ -132,30 +147,44 @@ class EngineCaller:
         return result
 
 
-def _from_verdicts(verdicts: list[Verdict], latency_ms: int) -> CaseResult:
+# Which decision speaks for a case when several verdicts arrived, most severe first.
+_PRECEDENCE = ("block", "flagged", "not_inspected")
+
+# Directions that mean the finding was on the way in, and on the way out.
+_INBOUND = frozenset(("prompt", "tool_input"))
+_OUTBOUND = frozenset(("response", "tool_output"))
+
+
+def _decision(verdict) -> str:
+    """A verdict's decision as its wire word, whatever type carries it."""
+    return getattr(getattr(verdict, "decision", ""), "value", "")
+
+
+def _from_verdicts(verdicts: list, latency_ms: int) -> CaseResult:
     """Fold the engine's verdicts into the flat shape scoring reads."""
-    real = [v for v in verdicts if v.inspected or v.errored]
+    real = [v for v in verdicts
+            if getattr(v, "inspected", False) or getattr(v, "errored", False)]
     if not real:
         return CaseResult(verdict="not_inspected", latency_ms=latency_ms)
 
-    lead = next((v for v in real if v.decision is Decision.BLOCK), None) \
-        or next((v for v in real if v.decision is Decision.FLAGGED), None) \
-        or next((v for v in real if v.decision is Decision.NOT_INSPECTED), None) \
-        or real[0]
+    lead = next((v for decision in _PRECEDENCE for v in real if _decision(v) == decision),
+                real[0])
 
-    hits = {(d.id, d.direction) for v in real for d in v.detections if d.hit}
+    hits = {(d.id, getattr(d.direction, "value", d.direction))
+            for v in real for d in getattr(v, "detections", ()) if d.hit}
     directions = {d for _, d in hits}
     # The console's words, kept because the stored rows are read beside older runs.
     caught = ("요청+응답" if len(directions) > 1
-              else "요청" if directions & {Direction.PROMPT, Direction.TOOL_INPUT}
-              else "응답" if directions & {Direction.RESPONSE, Direction.TOOL_OUTPUT}
+              else "요청" if directions & _INBOUND
+              else "응답" if directions & _OUTBOUND
               else "-")
 
     return CaseResult(
-        verdict=lead.decision.value,
-        scan_id=lead.scan_id or next((v.scan_id for v in real if v.scan_id), ""),
+        verdict=_decision(lead),
+        scan_id=getattr(lead, "scan_id", "") or next(
+            (v.scan_id for v in real if getattr(v, "scan_id", "")), ""),
         detectors=sorted({name for name, _ in hits}),
         caught=caught,
-        threats=sorted({t for v in real for t in v.threats}),
+        threats=sorted({t for v in real for t in getattr(v, "threats", ())}),
         latency_ms=latency_ms,
         error=next((v.error for v in real if v.error), ""))

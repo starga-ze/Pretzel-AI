@@ -1,50 +1,61 @@
-"""pretzel-ai's entry point — the counterpart to mgmtd/main.cpp on the other side of the wire.
+"""Entry point. Arguments and log level, then hand over to Core.
 
-Everything that happens once, at start: read the command line, decide the log level, hand off to
-src/core.py. Nothing about a chat turn is decided here, and nothing here is
-imported by anything that serves one — which is the point of the file existing. `core.serve` is
-importable on its own, so a test or a foreground probe can bring the service up without going
-through argument parsing.
-
-Run as `python -m src.main`; the systemd unit does exactly that (script/start.py).
+Nothing that serves a turn is imported here, so Core can be started from a test or a
+foreground probe without going through argument parsing.
 """
 
 import argparse
 import logging
 import os
+import sys
 
-from src import log as pa_log
-from src.core import serve
-
-log = logging.getLogger("pretzel-ai")
+from src.process import log as pa_log
+from src.process.core import Core
 
 LOG_LEVELS = ("debug", "info", "warning", "error")
 
-
-def parse_args(argv=None):
-    ap = argparse.ArgumentParser(prog="pretzel-ai",
-                                 description="pretzel-ai gRPC inference service")
-    ap.add_argument("--listen", default="127.0.0.1:50051",
-                    help="host:port to bind (default: 127.0.0.1:50051)")
-    # The request dump on Chat is DEBUG, and reaching it takes turning this up — which is the
-    # point: that dump carries whatever a person typed. Named rather than a bare --debug flag so
-    # the log itself records which level a run was at.
-    ap.add_argument("--log-level",
-                    default=os.environ.get("PZ_PRETZEL_AI_LOG_LEVEL", "info").lower(),
-                    choices=LOG_LEVELS,
-                    help="daemon log level (default: info)")
-    return ap.parse_args(argv)
+DEFAULT_LISTEN = "127.0.0.1:50051"
 
 
-def main(argv=None):
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="pretzel-ai")
+
+    parser.add_argument(
+        "--listen",
+        default=DEFAULT_LISTEN,
+        help="host:port to bind",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("PZ_PRETZEL_AI_LOG_LEVEL", "info").lower(),
+        choices=LOG_LEVELS,
+        help="daemon log level",
+    )
+    return parser.parse_args(argv)
+
+
+def setup_logging(level_name: str) -> None:
+    """The root logger, set once. Delegated to process/log.py rather than done here.
+
+    basicConfig() stood in for this and quietly cost the daemon its log FILE: it attaches a stream
+    handler and nothing else, so everything went to stdout, journald caught it, and
+    /var/log/pretzel-ai/pretzel-ai.log stopped growing the moment this process took over. An
+    operator following that file with `tail -f` sees a service that has gone silent rather than one
+    that is logging somewhere else.
+
+    What is passed here is what the unit file or the command line asked for. It is not necessarily
+    what runs: process/log.py has an OVERRIDE_LEVEL that wins, and says so when it does.
+    """
+    pa_log.setup(getattr(logging, level_name.upper()))
+
+
+def main(argv=None) -> int:
     args = parse_args(argv)
+    setup_logging(args.log_level)
 
-    pa_log.setup(getattr(logging, args.log_level.upper()))
-    if args.log_level == "debug":
-        log.warning("log level is DEBUG — request dumps include the text operators typed")
-
-    serve(args.listen)
+    core = Core(listen_address=args.listen)
+    return core.run()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

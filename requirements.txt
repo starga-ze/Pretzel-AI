@@ -9,16 +9,45 @@ grpcio-tools==1.62.1
 # writer of the `pretzel` configuration database.
 psycopg[binary]==3.2.3
 
-# The Portkey gateway client. Not needed to make the call — src/gateway.py speaks the same HTTP
-# with urllib — but a customer deployment is easier to reason about when the appliance uses the
-# vendor's own SDK: their docs, their examples, their retry and timeout defaults.
+# The AI Gateway client, used by src/transport/ai_gateway.py. The package and its client class
+# still carry the pre-acquisition Portkey name, and so does the x-portkey-trace-id header; those
+# are wire and dependency facts, so the codebase says "AI Gateway" everywhere the name is ours to
+# choose and Portkey only where it is not.
+#
+# Not needed to make the call — the same HTTP goes out with urllib — but a customer deployment is
+# easier to reason about when the appliance uses the vendor's own SDK: their docs, their examples,
+# their retry and timeout defaults.
 #
 # Two things about it are load-bearing here and were verified before pinning:
-#   - a successful turn keeps `hook_results` on the response (r.model_dump() has it), so
-#     gateway.extract_scan() reads the AIRS verdict unchanged;
+#   - a successful turn keeps `hook_results` on the response (r.model_dump() has it), so an
+#     inline guardrail's verdict survives to be read;
 #   - a guardrail block arrives as APIStatusError (446), and the hook results survive on
-#     e.response.json(). Reading the verdict off the EXCEPTION is what keeps "was this turn
-#     inspected" separate from "did this turn succeed" — see the note at the top of gateway.py.
+#     e.response.json() — NOT on e.body. Reading the verdict off the EXCEPTION is what keeps "was
+#     this turn inspected" separate from "did this turn succeed".
 # A future version that drops either of those breaks the console's scan panel silently, which is
 # why this is pinned rather than floating.
 portkey-ai==2.3.4
+
+# The Prisma AIRS scan API client, for the api_application guardrail.
+#
+# This REVERSES an earlier decision, and the reason it was made is worth keeping: the SDK was
+# rejected as "a generated OpenAPI client wrapped around aiohttp" that dragged twenty-one
+# transitive packages onto an appliance to send one JSON body urllib already sent. That reading
+# was of the wrong half of the package. Measured 2026-09-02:
+#
+#   - aisecurity.scan.asyncio  is the aiohttp one.
+#   - aisecurity.scan.inline   is urllib3 and SYNCHRONOUS, which is what a gRPC worker thread
+#     needs. No asyncio bridge, no event loop to own.
+#
+# What it is here for is the SCHEMA, not the transport. The scan API has traps that cost a day
+# each to find by hand — tool_event.metadata is NESTED (flattened, the service answers 400
+# `invalid tool event`), and tool_event.input/output are JSON *strings*, not objects (objects
+# answer 500) — and every one of them is already encoded in the generated models. Hand-assembling
+# that dict is where the bugs were.
+#
+# One limit, measured the same day and the reason the generated client may be called directly
+# rather than through Scanner.sync_scan(): sync_scan takes ONE Content and wraps it in a
+# single-element `contents` array. AIRS judges the LAST element of that array and reads the ones
+# before it as context, so a single-element wrapper gives up the ability to send conversation
+# context with a scan. The models are worth taking; that wrapper is not.
+pan-aisecurity==0.11.0

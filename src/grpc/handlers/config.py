@@ -25,7 +25,7 @@ each a fact about the thing being called, and all three are compiled in here.
 
 import logging
 
-from src.factory import ConfigError
+from src.deployment.config import AGENT, CHAT, Config, ConfigRefused
 from src.grpc import pretzel_ai_pb2
 
 log = logging.getLogger("pretzel-ai")
@@ -113,10 +113,10 @@ class ConfigHandlers:
                  "stored" if document["gateway_api_key"] else "none")
 
         try:
-            self._deployment.apply(document)
-        except ConfigError as exc:
-            # A document that cannot produce an engine. The service keeps serving the one it had —
-            # Deployment.apply builds before it swaps — so this is a refusal, not an outage.
+            self.apply_config(Config.from_document(document))
+        except ConfigRefused as exc:
+            # A document that cannot produce engines. The service keeps serving the ones it had —
+            # Core.apply_config builds before it swaps — so this is a refusal, not an outage.
             log.error("ApplyConfig refused: %s", exc)
             return pretzel_ai_pb2.ApplyConfigResult(ok=False, error=str(exc),
                                                     version=request.version)
@@ -125,7 +125,8 @@ class ConfigHandlers:
             return pretzel_ai_pb2.ApplyConfigResult(ok=False, error=str(exc),
                                                     version=request.version)
 
-        engine = self._deployment.engine
-        log.info("deployment applied: %s, models=%d (default %s)", engine.describes,
-                 len(engine.catalog), engine.catalog.default or "none")
+        # Every service, because the document configures them apart: a line naming only chat
+        # would hide an agent that came up on something else.
+        for name in (CHAT, AGENT):
+            log.info("deployment applied: service %s: %s", name, self.describe_service(name))
         return pretzel_ai_pb2.ApplyConfigResult(ok=True, version=request.version)
