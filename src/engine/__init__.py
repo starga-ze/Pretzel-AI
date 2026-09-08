@@ -273,9 +273,9 @@ class Engine:
     # everything else in the appliance either produces a verdict or serves a completion, and this
     # is the only thing that acts on either.
     #
-    #   1. Nothing leaves before the prompt scan returns. On the direct leg the appliance is the
-    #      only thing between the operator's words and a third-party model, and scanning after the
-    #      call would mean the data has already left the building.
+    #   1. Nothing leaves before the prompt scan returns. On the direct transport the appliance is
+    #      the only thing between the operator's words and a third-party model, and scanning after
+    #      the call would mean the data has already left the building.
     #   2. Nothing reaches the operator before the response scan returns. This is what makes token
     #      streaming impossible on a guarded path - you cannot stream a token and then decide to
     #      block it - and why the handler re-streams a finished answer.

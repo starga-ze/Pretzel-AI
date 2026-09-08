@@ -73,13 +73,3 @@ class PretzelAiServicer(
         """Adopt a pushed configuration. Raises when it cannot produce engines."""
         self._core.apply_config(config)
 
-    def describe_service(self, service_type) -> str:
-        """One line for the log, whether or not the service is ready."""
-        services = self._core.services
-        if services is None:
-            return "not configured"
-
-        service = services.get_service(service_type)
-        if service is None:
-            return "unknown service"
-        return service.describe()

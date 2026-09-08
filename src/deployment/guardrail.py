@@ -1,14 +1,19 @@
 """Who inspects a turn, built from one service's configuration.
 
-The other axis, and only that one. This module never decides which leg serves the completion -
-transport.py does, asked for by name in engine.py - so a guardrail can be added to a deployment
-without moving its traffic, and a leg can be moved without changing who looks at it.
+The other axis, and only that one. This module never decides which transport serves the
+completion - transport.py does, asked for by name in engine.py - so a guardrail can be added to a
+deployment without moving its traffic, and a transport can be changed without changing who looks
+at it.
 
     api_application   this appliance calls the Prisma AIRS scan API and holds the enforcement
-                      point                                        [not built - see below]
-    ai_gateway        the gateway's own configuration governs inspection; this reads its
-                      verdict off the completion                   [not built - see below]
+                      point. Valid on EITHER transport         [not built - see below]
     (none)            nobody inspects. Expressed as None by the caller, not as a builder here
+
+Reading a verdict off a completion an AI gateway already annotated used to be a third option here.
+It is gone: what it bought was inspection this appliance could not describe, configure or report
+on - the profile, the detectors and the thresholds all lived in someone else's console - and it
+could not see tool calls at all, which is the surface the agent service exists for. The gateway is
+a transport now, and nothing else.
 
 The vocabulary a verdict speaks - Verdict, Decision, the four checkpoints - is not here. That
 belongs with the implementations that produce it; this module reads a ServiceConfig and returns
@@ -58,21 +63,6 @@ def api_application(service: "cfg.ServiceConfig", config: "cfg.Config"):
     #     return _gated(AirsGuardrail(AirsClient(settings)), service)
     # except ValueError as exc:
     #     raise GuardrailError(str(exc)) from exc
-
-
-def ai_gateway(service: "cfg.ServiceConfig"):
-    """The gateway's own configuration governs inspection; this reads its verdict.
-
-    It makes no scan request. Choosing it means saying "the gateway decides", which is a real
-    answer and the one you want when the gateway is what is under test.
-    """
-    raise GuardrailError("the gateway guardrail is not built on this appliance yet")
-
-    # if not service.gateway_require_verdict:
-    #     log.info("guardrail delegated to the gateway - set 'require verdict' to fail turns "
-    #              "it did not inspect")
-    #
-    # return _gated(GatewayGuardrail(require_guardrail=service.gateway_require_verdict), service)
 
 
 # -- the checkpoints --------------------------------------------------------------------

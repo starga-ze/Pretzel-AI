@@ -36,7 +36,7 @@ class Model:
     provider: str = ""
     token_param: str = DEFAULT_TOKEN_PARAM
 
-    # Only used when the LLM leg bypasses the gateway: which direct endpoint serves this model.
+    # Only used when the transport bypasses the gateway: which direct endpoint serves this model.
     endpoint: str = ""
 
     @property

@@ -25,7 +25,7 @@ each a fact about the thing being called, and all three are compiled in here.
 
 import logging
 
-from src.deployment.config import AGENT, CHAT, Config, ConfigRefused
+from src.deployment.config import Config, ConfigRefused
 from src.grpc import pretzel_ai_pb2
 
 log = logging.getLogger("pretzel-ai")
@@ -36,6 +36,7 @@ def _service(entry):
     cp = entry.checkpoints
     return {
         "service": entry.service,
+        "transport": entry.transport,
         "guardrail": entry.guardrail,
         "checkpoints": {
             "prompt": cp.prompt,
@@ -46,7 +47,6 @@ def _service(entry):
         "airs_profile_name": entry.airs_profile_name,
         "airs_timeout_sec": entry.airs_timeout_sec,
         "airs_fail_open": entry.airs_fail_open,
-        "gateway_require_verdict": entry.gateway_require_verdict,
         "gateway_timeout_sec": entry.gateway_timeout_sec,
         "system_prompt": entry.system_prompt,
         "max_tokens": entry.max_tokens,
@@ -83,6 +83,39 @@ def _document(request):
     }
 
 
+def _shape(service: dict) -> str:
+    """One service, as the ApplyConfig line reports it.
+
+    Counted and named, never valued. Which vendors are configured, which transport they are called
+    on and which checkpoints are live is operational information; the keys are not, and neither
+    are their lengths.
+
+    The transport is here because it is now its own field and a line naming only the guardrail
+    could no longer say which path the turns take. The AIRS profile is here because it is the OTHER thing
+    an api_application service refuses to build without - a document that named the guardrail and
+    left the profile empty produced a refusal this line gave no way to see coming.
+    """
+    live = []
+    for field, label in (("prompt", "prompt"), ("response", "response"),
+                         ("tool_call", "tool-call"), ("tool_result", "tool-result")):
+        if service["checkpoints"][field]:
+            live.append(label)
+
+    line = "%s=%s/%s(%s)" % (
+        service["service"] or "?",
+        service["transport"] or "unset",
+        service["guardrail"] or "?",
+        "+".join(live) or "none",
+    )
+
+    # Named only where it is read, so the line does not invite an operator to wonder why a
+    # deployment that never scans here is reporting a profile.
+    if service["guardrail"] == "api_application":
+        line += " profile=%s" % (service["airs_profile_name"] or "UNSET")
+
+    return line
+
+
 class ConfigHandlers:
     """ApplyConfig. A mixin; PretzelAiServicer composes it with the generated base."""
 
@@ -90,19 +123,7 @@ class ConfigHandlers:
         document = _document(request)
 
         provs = document["providers"]
-        # Counted and named, never valued. Which vendors are configured and which checkpoints are
-        # live is operational information; the keys are not, and neither are their lengths.
-        shape = ", ".join(
-            "%s=%s(%s)" % (
-                s["service"] or "?",
-                s["guardrail"] or "?",
-                "+".join(n for f, n in (("prompt", "prompt"), ("response", "response"),
-                                        ("tool_call", "tool-call"),
-                                        ("tool_result", "tool-result"))
-                         if s["checkpoints"][f]) or "none",
-            )
-            for s in document["services"]
-        )
+        shape = ", ".join(_shape(s) for s in document["services"])
         log.info("ApplyConfig: version=%s, providers=%d (keyed=%d), models=%d, services=[%s], "
                  "airs_key=%s, gateway_key=%s",
                  document["version"] or "unknown", len(provs),
@@ -125,8 +146,7 @@ class ConfigHandlers:
             return pretzel_ai_pb2.ApplyConfigResult(ok=False, error=str(exc),
                                                     version=request.version)
 
-        # Every service, because the document configures them apart: a line naming only chat
-        # would hide an agent that came up on something else.
-        for name in (CHAT, AGENT):
-            log.info("deployment applied: service %s: %s", name, self.describe_service(name))
+        # What became of each service is NOT reported here. Services.build writes one line per
+        # service as it builds them - with the version on it, which this loop could not have had -
+        # so repeating it after the fact only made every push say the same thing twice.
         return pretzel_ai_pb2.ApplyConfigResult(ok=True, version=request.version)

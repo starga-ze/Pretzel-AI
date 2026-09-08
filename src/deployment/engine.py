@@ -9,9 +9,10 @@ An engine is three things held together:
 Each has its own builder and its own module - catalog.py, transport.py, guardrail.py - and
 _build_route pairs them. Which pair a configuration means is read there and nowhere else.
 
-Only the direct path is built today, so the guardrail half of that pair is None. What the
-engine does with that is the engine's to say - guardrail.py refuses any configuration that
-named an inspector, so None here can only ever mean "this deployment has none".
+The transport and the inspector arrive as two independent fields and are built by two functions
+that read one field each, so every meaningful combination of them is expressible. What is not built
+is either INSPECTOR: both guardrail builders refuse, so a configuration that named one is
+refused and `guardrail` here is None only when the document said "none".
 
 Two scopes, and they are not the same
 -------------------------------------
@@ -63,7 +64,7 @@ class ServiceNotBuilt(EngineError):
 
 def build_chat_engine(service: "cfg.ServiceConfig", config: "cfg.Config") -> ChatEngine:
     """One model call per turn. The only engine this appliance builds."""
-    catalog = _build_catalog(config)
+    catalog = _build_catalog(service, config)
     transport, guardrail = _build_route(service, config, catalog)
 
     engine = ChatEngine(
@@ -77,13 +78,15 @@ def build_chat_engine(service: "cfg.ServiceConfig", config: "cfg.Config") -> Cha
 
     # The system prompt is reported as set/none and never printed: it is operator text, and the
     # rule that keeps it out of an INFO line keeps it out of a DEBUG one that runs on every build.
-    log.debug("[4/5] engine (class=%s, service=%s, system_prompt=%s, max_tokens=%d, "
+    log.debug("engine (version=%s, service=%s, class=%s, system_prompt=%s, max_tokens=%d, "
               "fail_open=%s)",
-              type(engine).__name__, service.name,
+              config.version or "none", service.name, type(engine).__name__,
               "set" if service.system_prompt else "none",
               service.max_tokens, service.airs_fail_open)
 
-    log.info("service %s ready: %s", service.name, engine.describes)
+    # The line that says this service is up is service.py's, not this module's. It used to be here
+    # too, so every successful build wrote two - and the one over there is the only one that can
+    # also speak for a service that did NOT build.
     return engine
 
 
@@ -104,7 +107,7 @@ def build_agent_engine(service: "cfg.ServiceConfig", config: "cfg.Config"):
     """
     raise ServiceNotBuilt("the agent service is not built on this appliance yet")
 
-    # catalog = _build_catalog(config)
+    # catalog = _build_catalog(service, config)
     # transport, guardrail = _build_route(service, config, catalog)
     # return AgentEngine(transport, guardrail, catalog, ...)
 
@@ -115,18 +118,15 @@ def build_agent_engine(service: "cfg.ServiceConfig", config: "cfg.Config"):
 def _build_route(service: "cfg.ServiceConfig", config: "cfg.Config", catalog: Catalog):
     """→ (transport, guardrail). The deployment matrix, and the only place it is read.
 
-    TWO axes, written out as pairs rather than derived from each other. One console field picks
-    the row today - `service.guardrail` - and that is a fact about the console, not about the
-    appliance: the leg a turn goes out on and the thing that inspects it are separate questions
-    with separate answers, built by separate modules.
+    TWO axes, arriving as two fields and answered on their own by the module that owns each. This
+    function only pairs them:
 
-        none              direct  + nothing        how a customer with no guardrail runs
-        api_application   direct  + AIRS           the appliance holds the enforcement point
-        ai_gateway        gateway + its verdict    what a gateway deployment looks like
+        transport    direct | ai_gateway            -> deployment/transport.py
+        guardrail    none | api_application         -> deployment/guardrail.py
 
-    The row that is NOT here is the one this shape exists to keep reachable: gateway + AIRS - the
-    gateway for its routing, the scanning done here. Adding it is one arm below, calling two
-    builders that already exist, and nothing else moves.
+    They multiply out cleanly - four pairs, all four meaningful - because neither constrains the
+    other. Scanning is done HERE from the turn itself, so it reaches all four checkpoints on either
+    transport; the gateway is a route and nothing more.
 
     `guardrail` is None when nothing inspects. A caller must not read that as permission: it means
     no verdict exists, which reaches the console as scan.present=false and is drawn there as
@@ -136,30 +136,52 @@ def _build_route(service: "cfg.ServiceConfig", config: "cfg.Config", catalog: Ca
     module's: the caller asked for an engine and did not get one, and which axis was missing is a
     detail of the message rather than of the exception type.
     """
-    kind = service.guardrail
-
     try:
-        if kind == cfg.GUARDRAIL_NONE:
-            transport = transport_builder.direct(config, catalog, service)
-            log.debug("[3/5] guardrail (kind=none, checkpoints=[], "
-                      "note=nothing is asked, every turn reports NOT_INSPECTED)")
-            return transport, None
-
-        if kind == cfg.GUARDRAIL_API_APPLICATION:
-            return (transport_builder.direct(config, catalog, service),
-                    guardrail_builder.api_application(service, config))
-
-        if kind == cfg.GUARDRAIL_AI_GATEWAY:
-            return (transport_builder.ai_gateway(service, config, catalog),
-                    guardrail_builder.ai_gateway(service))
-
+        transport = _build_transport(service, config, catalog)
+        guardrail = _build_guardrail(service, config)
     except (transport_builder.TransportError, guardrail_builder.GuardrailError) as exc:
         raise EngineError(str(exc)) from exc
 
-    raise EngineError("unknown guardrail: " + str(kind))
+    return transport, guardrail
 
 
-def _build_catalog(config: "cfg.Config") -> Catalog:
+def _build_transport(service: "cfg.ServiceConfig", config: "cfg.Config", catalog: Catalog):
+    """Which transport carries the completion. Reads `service.transport` and nothing else.
+
+    An unrecognised value is refused here rather than defaulted in config.py - see _read_route for
+    why nothing on either axis is guessed.
+    """
+    if service.transport == cfg.TRANSPORT_DIRECT:
+        return transport_builder.direct(config, catalog, service)
+
+    if service.transport == cfg.TRANSPORT_AI_GATEWAY:
+        return transport_builder.ai_gateway(service, config, catalog)
+
+    raise EngineError("unknown transport: '%s' - expected one of %s"
+                      % (service.transport, ", ".join(cfg.TRANSPORTS)))
+
+
+def _build_guardrail(service: "cfg.ServiceConfig", config: "cfg.Config"):
+    """Who inspects the turn. Reads `service.guardrail` and nothing else.
+
+    → None when nothing does. The `none` row is logged here rather than in guardrail.py because
+    that module has no builder for it: there is no object to construct, and a builder that
+    returned None would exist only to have somewhere to put this line.
+    """
+    if service.guardrail == cfg.GUARDRAIL_NONE:
+        log.debug("guardrail (version=%s, service=%s, kind=none, checkpoints=[], "
+                  "note=nothing is asked, every turn reports NOT_INSPECTED)",
+                  config.version or "none", service.name)
+        return None
+
+    if service.guardrail == cfg.GUARDRAIL_API_APPLICATION:
+        return guardrail_builder.api_application(service, config)
+
+    raise EngineError("unknown guardrail: '%s' - expected one of %s"
+                      % (service.guardrail, ", ".join(cfg.GUARDRAILS)))
+
+
+def _build_catalog(service: "cfg.ServiceConfig", config: "cfg.Config") -> Catalog:
     """Which models may be asked for, and which one a conversation opens on.
 
     Appliance-wide, and read from Config rather than from a ServiceConfig: the two services
@@ -182,6 +204,7 @@ def _build_catalog(config: "cfg.Config") -> Catalog:
     for provider in config.providers:
         providers.append(provider.provider_id)
 
-    log.debug("[1/5] catalog (models=%d, default=%s, providers=[%s])",
-              len(catalog), catalog.default or "none", ",".join(providers) or "none")
+    log.debug("catalog (version=%s, service=%s, models=%d, default=%s, providers=[%s])",
+              config.version or "none", service.name, len(catalog),
+              catalog.default or "none", ",".join(providers) or "none")
     return catalog

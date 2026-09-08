@@ -66,12 +66,18 @@ CHAT = ServiceType.CHAT
 AGENT = ServiceType.AGENT
 SERVICES = tuple(ServiceType)
 
-# Who inspects a turn. The choice also decides which leg serves the completion, because
-# there is no gateway on the direct path to defer inspection to.
+# Which transport serves the completion. One of the two axes of a deployment, and named for the
+# thing that carries it: transport/ holds the implementations, deployment/transport.py builds one,
+# and this is the field that says which. One word for one concept, all the way down.
+TRANSPORT_DIRECT = "direct"
+TRANSPORT_AI_GATEWAY = "ai_gateway"
+TRANSPORTS = (TRANSPORT_DIRECT, TRANSPORT_AI_GATEWAY)
+
+# Who inspects a turn. The other axis, and fully independent of the first: api_application runs on
+# either transport, so the two multiply out with no unreachable pair between them.
 GUARDRAIL_NONE = "none"
 GUARDRAIL_API_APPLICATION = "api_application"
-GUARDRAIL_AI_GATEWAY = "ai_gateway"
-GUARDRAILS = (GUARDRAIL_NONE, GUARDRAIL_API_APPLICATION, GUARDRAIL_AI_GATEWAY)
+GUARDRAILS = (GUARDRAIL_NONE, GUARDRAIL_API_APPLICATION)
 
 # The four points in a turn where something can be looked at.
 POINT_PROMPT = "prompt"
@@ -87,12 +93,16 @@ SERVICE_POINTS = {
     AGENT: (POINT_PROMPT, POINT_RESPONSE, POINT_TOOL_CALL, POINT_TOOL_RESULT),
 }
 
-# What each guardrail can serve. The gateway builds its scan request from a completion's
-# text content; tool calls never reach the scanner, whatever the configuration says.
+# What each guardrail can serve. Keyed by the inspector alone and not by the transport, which is
+# what makes the two axes orthogonal: scanning here reaches all four points whichever transport
+# carries the completion, because the scan request is built HERE from the turn rather than by
+# something reading a completion document after the fact.
+#
+# Which of the four a SERVICE then has is its own answer - see SERVICE_POINTS. Chat has no tools,
+# so it reaches two of these however the guardrail is configured.
 GUARDRAIL_POINTS = {
     GUARDRAIL_NONE: (),
     GUARDRAIL_API_APPLICATION: POINTS,
-    GUARDRAIL_AI_GATEWAY: (POINT_PROMPT, POINT_RESPONSE),
 }
 
 # Where each vendor answers. Compiled in rather than configured: which URL it is, is a fact
@@ -147,6 +157,9 @@ class ServiceConfig:
     """
 
     name: "ServiceType | str" = CHAT
+
+    # The two axes, held apart. Read as a pair by deployment/engine.py and by nothing else.
+    transport: str = TRANSPORT_DIRECT
     guardrail: str = GUARDRAIL_NONE
 
     # What the operator asked for. Not what will run - see active_points().
@@ -156,7 +169,6 @@ class ServiceConfig:
     airs_timeout_sec: float = DEFAULT_AIRS_TIMEOUT_SEC
     airs_fail_open: bool = False
 
-    gateway_require_verdict: bool = False
     gateway_timeout_sec: float = DEFAULT_GATEWAY_TIMEOUT_SEC
 
     system_prompt: str = ""
@@ -188,8 +200,12 @@ class ServiceConfig:
         return tuple(active)
 
     def uses_gateway(self) -> bool:
-        """Whether the completion goes through the AI gateway rather than to the vendor."""
-        return self.guardrail == GUARDRAIL_AI_GATEWAY
+        """Whether the completion goes through the AI gateway rather than to the vendor.
+
+        Reads the transport. It used to read the guardrail, which was true only because one field
+        said both things - and the reason a caller asks this is never "who inspects".
+        """
+        return self.transport == TRANSPORT_AI_GATEWAY
 
 
 @dataclass
@@ -277,12 +293,12 @@ class Config:
         for service in self.services.values():
             services.append({
                 "service": service.name,
+                "transport": service.transport,
                 "guardrail": service.guardrail,
                 "checkpoints": dict(service.points),
                 "airs_profile_name": service.airs_profile_name,
                 "airs_timeout_sec": service.airs_timeout_sec,
                 "airs_fail_open": service.airs_fail_open,
-                "gateway_require_verdict": service.gateway_require_verdict,
                 "gateway_timeout_sec": service.gateway_timeout_sec,
                 "system_prompt": service.system_prompt,
                 "max_tokens": service.max_tokens,
@@ -374,13 +390,28 @@ def _provider_from(raw: dict) -> ProviderConfig:
     return provider
 
 
+def _read_route(service: ServiceConfig, raw: dict) -> None:
+    """The two axes, as the document states them.
+
+    Written through UNFILTERED, which is the opposite of what this module does everywhere else and
+    is deliberate. A value neither axis recognises - a typo, or an empty field from a push that
+    predates one of them - must not be quietly rounded to a default: the default on the guardrail
+    axis is "none", so rounding would turn a service configured to be inspected into one that
+    serves turns uninspected, which is the single failure this codebase is built to prevent.
+
+    So the unknown value survives to deployment/engine.py, where _build_transport and
+    _build_guardrail refuse it by name and the push is reported as refused. Loud and diagnosable
+    beats silent and wrong; there is no reading of an unrecognised deployment that is safe to guess.
+    """
+    service.transport = raw.get("transport") or ""
+    service.guardrail = raw.get("guardrail") or ""
+
+
 def _service_from(raw: dict) -> ServiceConfig:
     service = ServiceConfig()
     service.name = ServiceType.of(raw.get("service") or CHAT)
 
-    guardrail = raw.get("guardrail") or GUARDRAIL_NONE
-    if guardrail in GUARDRAILS:
-        service.guardrail = guardrail
+    _read_route(service, raw)
 
     raw_points = raw.get("checkpoints") or {}
     for point in POINTS:
@@ -390,7 +421,6 @@ def _service_from(raw: dict) -> ServiceConfig:
     service.airs_timeout_sec = float(raw.get("airs_timeout_sec") or DEFAULT_AIRS_TIMEOUT_SEC)
     service.airs_fail_open = bool(raw.get("airs_fail_open", False))
 
-    service.gateway_require_verdict = bool(raw.get("gateway_require_verdict", False))
     service.gateway_timeout_sec = float(
         raw.get("gateway_timeout_sec") or DEFAULT_GATEWAY_TIMEOUT_SEC)
 

@@ -9,12 +9,12 @@ chasing a timeout, a credential or a retry looks here and nowhere else.
 
 Which of the two a service runs is decided in deployment/engine.py and asked for by name in
 deployment/transport.py. Neither file here reads `service.guardrail`, and neither knows one
-exists: the leg and the inspector are separate axes, and a customer on the direct leg who is
-given a guardrail must not become a customer whose traffic moved.
+exists: the transport and the inspector are separate axes, and a customer on the direct transport
+who is given a guardrail must not become a customer whose traffic moved.
 
 There is no shared Protocol. Both classes expose `complete(...)` and `describes`, and the engine
 holds whichever it was handed - but an interface with two implementations that already agree
-documents nothing that reading either class does not. It becomes worth naming when a third leg
+documents nothing that reading either class does not. It becomes worth naming when a third transport
 arrives and the agreement stops being obvious.
 
 Logger names mirror the module path - pretzel-ai.transport.direct and

@@ -179,15 +179,12 @@ class Core:
         """What this daemon is, on the lines an operator reads first."""
         log.info("listening on %s", self.listen_address)
 
-        if self.services is None:
-            return
-
-        for service in self.services.all():
-            if service.engine is None:
-                log.info("service %s: not configured", service.name)
-            else:
-                log.info("service %s: %s", service.name, service.engine.describes)
-
+        # The services are NOT listed again here. Services.build wrote one line for each of them,
+        # with its reason and the version it was built from, a few milliseconds ago - and this
+        # block used to print a second, thinner copy of the same thing under a different wording.
+        #
+        # What is left is the pair a reader wants at the point the daemon starts answering: the
+        # address, and which configuration version it came up on.
         if self.config is None:
             version = 0
         else:

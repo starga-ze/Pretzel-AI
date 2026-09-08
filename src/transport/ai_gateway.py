@@ -1,8 +1,8 @@
-"""The LLM leg through the AI Gateway.
+"""The transport through the AI Gateway.
 
 The other implementation of the same job direct.py does, and chosen the same way: by name, in
 deployment/transport.py. Nothing here reads which guardrail was configured, and nothing in
-guardrail/ reads which leg this is.
+guardrail/ reads which transport this is.
 
 Uses the gateway's own SDK rather than hand-rolled HTTP. Not because the call is hard - it is one JSON
 POST - but because a customer deployment is easier to reason about when the appliance is running

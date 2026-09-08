@@ -201,11 +201,11 @@ message AiProvider {
 // first. Off does NOT mean allow — the checkpoint answers NOT_INSPECTED, so a report can still
 // tell a clean scan from one that never ran.
 //
-// Not every combination is reachable, and the unreachable ones are a fact about the deployment
-// rather than a setting: Chat has no tools at all, and the AI gateway cannot see them (it builds
-// its scan request from a completion's text `content`, and `tool_calls` is a sibling of `content`
-// that never reaches the scanner). pretzel-ai reads these against what the service and the
-// guardrail can actually serve; the console greys out what it cannot.
+// Not every point exists in every row, and that is a fact about the deployment rather than a
+// setting: Chat has no tools at all, so its two tool checkpoints are absent rather than off. The
+// transport does not narrow them — api_application builds its scan request here from the turn, so
+// all four are reachable whichever transport carries the completion. pretzel-ai reads these
+// against what the service and the guardrail can actually serve; the console greys out the rest.
 message Checkpoints {
   bool prompt = 1;        // before the model is called
   bool response = 2;      // after it answers, before anyone sees it
@@ -230,14 +230,40 @@ message Checkpoints {
 message ServiceConfig {
   string service = 1;     // "chat" | "agent" — which engine this configures. One entry each.
 
-  // Who inspects, and by consequence which LLM leg serves the completion:
-  //   "none"             nobody inspects; the vendors are called directly. A real deployment,
-  //                      written down — every checkpoint reports NOT_INSPECTED rather than allowing.
+  // TWO axes, and they are two fields because they are two questions. Which transport carries the
+  // completion and who inspects the turn were one string until 2026-09-07 — "ai_gateway" named a
+  // route and an inspector at once — and that single field could not express the deployments a
+  // customer actually asks for: the gateway for its routing with the scanning held HERE, or the
+  // gateway purely for routing with nothing inspecting at all. Neither is exotic, and neither was
+  // sayable. It also put a category error on the console: a field labelled "guardrail" whose value
+  // was a piece of infrastructure.
+  //
+  // pretzel-ai builds them apart — deployment/transport.py and deployment/guardrail.py, paired
+  // once in deployment/engine.py — so the pair below is read, never derived.
+  //
+  // NEITHER field is optional and neither has a default on this wire. An empty or unrecognised
+  // value is refused by name rather than rounded to something sensible: rounding the guardrail
+  // axis would turn a service configured to be inspected into one that serves turns uninspected,
+  // which is the failure this whole contract exists to prevent. mgmtd writes both on every push.
+
+  // Which transport serves the completion.
+  //   "direct"       each vendor called at its own endpoint, with its own key
+  //   "ai_gateway"   the AI gateway serves it and routes upstream
+  string transport = 11;
+
+  // Who inspects the turn.
+  //   "none"             nobody inspects. A real deployment, written down — every checkpoint
+  //                      reports NOT_INSPECTED rather than allowing.
   //   "api_application"  this appliance calls the Prisma AIRS scan API and holds the enforcement
-  //                      point; the vendors are called directly.
-  //   "ai_gateway"       the AI gateway routes the completion AND its own configuration governs
-  //                      inspection. The leg is not a separate choice: there is no gateway on the
-  //                      direct path to defer to, so choosing this moves the completion too.
+  //                      point. Valid on EITHER transport, and it reaches all four checkpoints on
+  //                      both: the scan request is built here from the turn, not read off a
+  //                      completion document afterwards.
+  //
+  // A third value, "delegated", let the AI gateway's own configuration govern inspection and had
+  // this appliance read the verdict off the completion. Retired 2026-09-07. It bought inspection
+  // pretzel-ai could not describe, configure or report on — profile, detectors and thresholds all
+  // lived in another console — and it could never see tool calls, which is the surface the agent
+  // service exists for. The gateway is a transport now, and nothing else.
   string guardrail = 2;
 
   Checkpoints checkpoints = 3;
@@ -250,9 +276,11 @@ message ServiceConfig {
   bool   airs_fail_open = 6;       // a scan that cannot be reached lets the turn through. Default
                                    // false: a guardrail that cannot rule stops the turn.
 
-  // ai_gateway only. The endpoint is likewise compiled in — the hosted gateway.
-  bool   gateway_require_verdict = 7;  // fail turns the gateway did not inspect. Without it,
-                                       // deferring means trusting that something over there looked.
+  // transport = "ai_gateway" only. The endpoint is likewise compiled in — the hosted gateway.
+  //
+  // 7 retired: `gateway_require_verdict` — "fail turns the gateway did not inspect". It configured
+  //   the delegated guardrail, which is gone; with nothing here reading a gateway's verdict, there
+  //   is no turn it could describe.
   double gateway_timeout_sec = 8;
 
   // How this service shapes a turn. Per service on purpose: an agent's system prompt is not a

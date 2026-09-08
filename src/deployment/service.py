@@ -51,6 +51,14 @@ class Services:
     Built as a set rather than one at a time: an ApplyConfig either produces a daemon that
     works or one that does not, and a half-applied document would leave chat on the new
     configuration and agent on the old with nothing saying so.
+
+    One line per service, whatever became of it, and every line carries the version and the
+    service. Both are load-bearing rather than decoration: ApplyConfig runs on the gRPC worker
+    pool, so two pushes overlap and their lines interleave - and a build writes four DEBUG lines
+    of its own before this one, for a service the reader otherwise has no way to name. There is
+    also only ONE line per outcome now. Every unsuccessful case used to write two, a sentence and
+    a numbered duplicate of it, and the numbering claimed a step in a five-stage build that had
+    not run any of its stages.
     """
 
     def __init__(self):
@@ -72,6 +80,7 @@ class Services:
         one unusable service must not stop the other from running.
         """
         services = cls()
+        version = config.version or "none"
 
         for service_type in cfg.SERVICES:
             service = services._services[service_type]
@@ -79,17 +88,15 @@ class Services:
 
             if service.config is None:
                 service.error = "not in the pushed configuration"
-                log.debug("[5/5] service (name=%s, state=skipped, "
-                          "reason=not in the pushed configuration)", service_type)
+                log.info("service skipped (version=%s, service=%s, "
+                         "reason=not in the pushed configuration)", version, service_type)
                 continue
 
             try:
                 service.engine = _build_engine(service_type, service.config, config)
                 service.error = ""
-                log.debug("[5/5] service (name=%s, state=ready, guardrail=%s, "
-                          "checkpoints=[%s])",
-                          service_type, service.config.guardrail,
-                          ",".join(service.config.active_points()))
+                log.info("service ready (version=%s, service=%s, %s)",
+                         version, service_type, service.engine.describes)
             except engine_builder.ServiceNotBuilt as exc:
                 # Caught before EngineError, which it subclasses. INFO rather than WARNING: the
                 # appliance is answering "I do not have that", which is a fact about this build
@@ -97,15 +104,13 @@ class Services:
                 service.engine = None
                 service.error = str(exc)
                 service.unimplemented = True
-                log.info("service %s: %s", service_type, exc)
-                log.debug("[5/5] service (name=%s, state=unimplemented, reason=%s)",
-                          service_type, exc)
+                log.info("service unimplemented (version=%s, service=%s, reason=%s)",
+                         version, service_type, exc)
             except engine_builder.EngineError as exc:
                 service.engine = None
                 service.error = str(exc)
-                log.warning("service %s cannot serve: %s", service_type, exc)
-                log.debug("[5/5] service (name=%s, state=failed, reason=%s)",
-                          service_type, exc)
+                log.warning("service failed (version=%s, service=%s, reason=%s)",
+                            version, service_type, exc)
 
         return services
 

@@ -1,13 +1,13 @@
 """Who serves the completion, built from one service's configuration.
 
-One axis of the deployment, and only one. Which leg a turn goes out on - straight to the vendor,
-or through the AI gateway - is decided by the caller in engine.py and asked for here by name; this
-module does not read `service.guardrail` and must not start, because a second place deriving the
-leg from the inspector is a second place for the two to disagree.
+One axis of the deployment, and only one. Which transport a turn goes out on - straight to the
+vendor, or through the AI gateway - is decided by the caller in engine.py and asked for here by
+name; this module does not read `service.guardrail` and must not start, because a second place
+deriving the transport from the inspector is a second place for the two to disagree.
 
-That separation is the point. The gateway leg and the AIRS guardrail are chosen by one console
-field today, but they are not the same fact: a customer on the direct leg who buys a guardrail
-should be a different argument at the call site, not a different function here.
+That separation is the point. The gateway transport and the AIRS guardrail are two fields, not
+one: a customer on the direct transport who buys a guardrail is a different argument at the call
+site, not a different function here.
 
     direct       each vendor called at its own endpoint, with its own key
     ai_gateway   the gateway serves it and routes upstream
@@ -52,7 +52,8 @@ def direct(config: "cfg.Config", catalog, service: "cfg.ServiceConfig"):
     if not endpoints:
         raise TransportError("no providers are configured")
 
-    log.debug("[2/5] transport (leg=direct, endpoints=[%s], timeout=%.1fs)",
+    log.debug("transport (version=%s, service=%s, kind=direct, endpoints=[%s], timeout=%.1fs)",
+              config.version or "none", service.name,
               ",".join(sorted(endpoints)), service.gateway_timeout_sec)
 
     return DirectTransport(
@@ -73,7 +74,9 @@ def ai_gateway(service: "cfg.ServiceConfig", config: "cfg.Config", catalog):
     if not config.gateway_api_key:
         raise TransportError("the AI gateway is selected but no gateway API key is stored")
 
-    log.debug("[2/5] transport (leg=ai_gateway, base_url=%s, timeout=%.1fs, key=stored)",
+    log.debug("transport (version=%s, service=%s, kind=ai_gateway, base_url=%s, timeout=%.1fs, "
+              "key=stored)",
+              config.version or "none", service.name,
               cfg.GATEWAY_BASE_URL, service.gateway_timeout_sec)
 
     return AiGatewayTransport(
