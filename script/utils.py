@@ -27,15 +27,13 @@ LOG_FILE = os.path.join(LOG_DIR, f"{DAEMON}.log")
 SERVICE_NAME = "pretzel-ai.service"
 SERVICE_PATH = os.path.join("/etc/systemd/system", SERVICE_NAME)
 
-# Keys, out of the repo. The unit reads this as an EnvironmentFile, and it is what makes the
-# service runnable on its own — for a developer, or a benchmark run with no appliance in front of
-# it. In a deployment the keys come from the appliance's sealed store over ApplyConfig, and a
-# pushed key wins over anything here.
+# State, out of the repo. Holds deployment.json, the 0600 cache of the last pushed document.
+# Root-owned and not in the repo.
 #
-# The same directory holds deployment.json, the 0600 cache of the last pushed document. Both are
-# root-owned and neither is in the repo.
+# It used to hold keys.env as well, read by the unit as an EnvironmentFile. That file is gone: no
+# key in it was read by anything. Every key arrives over ApplyConfig, and the daemon takes each one
+# from the pushed document - the env fallback the file documented was never wired to a reader.
 ENV_DIR = "/etc/pretzel-ai"
-ENV_FILE = os.path.join(ENV_DIR, "keys.env")
 STATE_FILE = os.path.join(ENV_DIR, "deployment.json")
 
 # Where mgmtd's gRPC client dials (must match PZ_PRETZEL_AI_TARGET on the mgmtd side).

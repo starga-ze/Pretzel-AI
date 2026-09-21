@@ -102,9 +102,10 @@ class Core:
     def _build_services(self, config: Config) -> Services:
         """One engine per service, built from the configuration.
 
-        Called again by the config service when ApplyConfig arrives. Building before
-        replacing is deliberate: a document that cannot produce working engines must leave
-        the daemon running the ones that could.
+        The one way services are built. run() takes this path at startup and apply_config takes
+        it on every push, so the two cannot drift: one line announcing the build, then whatever
+        Services.build reports per service. It used to say it was shared and not be - apply_config
+        called Services.build directly, and the line below never appeared on a push.
         """
         log.debug("building services (version=%s, services=[%s])",
                   config.version or "none", ",".join(str(n) for n in cfg.SERVICES))
@@ -120,7 +121,7 @@ class Core:
         the document leaves out is not a failure - the appliance decides which services
         exist. Built before anything is replaced, so a refusal costs nothing.
         """
-        services = Services.build(config)
+        services = self._build_services(config)
 
         failures = services.failures()
         if failures:

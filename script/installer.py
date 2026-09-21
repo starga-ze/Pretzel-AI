@@ -11,7 +11,7 @@ What install does:
   1. Preflight (root / OS / python / arch / wheels present)
   2. Place src, sql and config under <prefix>
   3. Create a venv and install from the bundled wheelhouse (no network needed)
-  4. Prepare /var/log/pretzel-ai and /etc/pretzel-ai/keys.env
+  4. Prepare /var/log/pretzel-ai and /etc/pretzel-ai
   5. Write the systemd unit, enable it, restart, and confirm it actually answers
 """
 
@@ -33,7 +33,6 @@ SERVICE_PATH = os.path.join("/etc/systemd/system", SERVICE_NAME)
 LOG_DIR = "/var/log/pretzel-ai"
 LOG_FILE = os.path.join(LOG_DIR, "pretzel-ai.log")
 ENV_DIR = "/etc/pretzel-ai"
-ENV_FILE = os.path.join(ENV_DIR, "keys.env")
 LISTEN = "127.0.0.1:50051"
 
 # Same shape as the repository's script/start.py. The only difference is WorkingDirectory, which
@@ -50,9 +49,6 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory={prefix}
 Environment="PZ_PRETZEL_AI_LOG_LEVEL={log_level}"
-# Keys live here, not in the repository and not in the config document. The leading '-' means a
-# missing file is not an error.
-EnvironmentFile=-{env_file}
 ExecStart={python} -m src.main --listen {listen}
 Restart=always
 RestartSec=3
@@ -62,18 +58,6 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 """
-
-ENV_TEMPLATE = """\
-# pretzel-ai keys — root only (0600). Read by the systemd unit as an EnvironmentFile.
-#
-# A fallback, not the source. In a deployment the appliance pushes these over ApplyConfig from its
-# sealed store, and a pushed key wins over anything here — an env var that outranked the console
-# would mean an operator rotating a key in the UI and watching nothing happen. Fill these in only
-# to run the service without an appliance in front of it.
-PANW_AI_SEC_API_KEY=
-PZ_PORTKEY_API_KEY=
-"""
-
 
 def say(msg):
     print(f"[*] {msg}")
@@ -249,23 +233,16 @@ def prepare_runtime_dirs():
     os.chmod(LOG_DIR, 0o755)
     say(f"Log directory: {LOG_DIR}")
 
+    # Holds deployment.json, the cache of the last pushed document, written by the daemon itself.
+    # No key file: every key arrives over ApplyConfig.
     os.makedirs(ENV_DIR, exist_ok=True)
     os.chmod(ENV_DIR, 0o755)
-    if not os.path.isfile(ENV_FILE):
-        with open(ENV_FILE, "w") as f:
-            f.write(ENV_TEMPLATE)
-        os.chmod(ENV_FILE, 0o600)
-        say(f"Created key file: {ENV_FILE}  <- fill this in")
-        return False
-    # Leave an existing one alone. Overwriting keys an operator put there is the worst thing
-    # this script could do.
-    say(f"Key file already exists; leaving it untouched: {ENV_FILE}")
-    return True
+    say(f"State directory: {ENV_DIR}")
 
 
 def write_unit(prefix, python, log_level):
     unit = UNIT_TEMPLATE.format(path=SERVICE_PATH, prefix=prefix, python=python,
-                                listen=LISTEN, env_file=ENV_FILE, log_level=log_level)
+                                listen=LISTEN, log_level=log_level)
     with open(SERVICE_PATH, "w") as f:
         f.write(unit)
     os.chmod(SERVICE_PATH, 0o644)
@@ -301,7 +278,7 @@ def install(args):
     prefix = os.path.abspath(args.prefix)
     place_payload(prefix)
     python = make_venv(prefix)
-    fresh_keys = not prepare_runtime_dirs()
+    prepare_runtime_dirs()
 
     write_unit(prefix, python, args.log_level)
     run_cmd(["systemctl", "daemon-reload"], msg="systemctl daemon-reload")
@@ -319,9 +296,6 @@ def install(args):
 
     print()
     say("Remaining steps:")
-    if fresh_keys:
-        print(f"      1. Fill in {ENV_FILE} (PANW_AI_SEC_API_KEY and friends)")
-        print(f"      2. sudo systemctl restart {SERVICE_NAME}")
     print(f"      - Database schema: apply {prefix}/sql/*.sql in numeric order")
     print(f"      - Status: systemctl status {SERVICE_NAME}")
     print(f"      - Log:    tail -f {LOG_FILE}")

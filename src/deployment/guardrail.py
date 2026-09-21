@@ -28,11 +28,13 @@ answerable one layer down at the generated `ScansApi`:
   1. one `contents` element per scan, so a conversation cannot be sent as context
   2. no per-request timeout, so `airs_timeout_sec` is configured and not applied - a hung scan
      holds a gRPC worker with nothing to interrupt it
-  3. the API key is frozen into a process-wide singleton at first use, so rotating it through
-     ApplyConfig needs a daemon restart
+  3. the API key is frozen into a process-wide singleton at first use. FIXED in that file
+     rather than here, and not by moving down a layer: a rotated key that is accepted and then
+     ignored is a revoked credential still in use, which cannot wait for a refactor. The other
+     two still stand.
 
-Moving to the generated client fixes all three and keeps the SDK's models, its urllib3 pool and
-its retries. It costs this file its value as sample code, which is why it has not been done yet.
+Moving to the generated client fixes the two that remain and keeps the SDK's models, its urllib3
+pool and its retries. It costs this file its value as sample code, which is why it has not been done yet.
 """
 
 import logging

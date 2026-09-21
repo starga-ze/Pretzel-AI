@@ -29,9 +29,14 @@ deployment/guardrail.py.
   2. NO per-request timeout. `_request_timeout` exists on the generated `ScansApi.scan_sync_request`
      and the wrapper does not forward it, so `airs_timeout_sec` cannot be applied here. The builder
      says so out loud on every build rather than letting a configured number look effective.
-  3. The API key is fixed at FIRST USE, for the life of the process. `ScanExecutor` is a
-     `@singleton` and freezes the key into a default header when it is constructed. A key rotated
-     through ApplyConfig reaches this object and not that one, so rotation needs a daemon restart.
+  3. The API key is fixed at FIRST USE by the SDK, and this file undoes that. `ScanExecutor`
+     is a `@singleton`: it builds its `ApiClient` once, reading `aisecurity.global_configuration`
+     at that moment and stamping the key into a default header. Every later `aisecurity.init()`
+     updates that global and reaches no client, so a rotated key used to be accepted at the push
+     and silently ignored on the wire. `_restamp_credentials` below writes the configured key
+     onto the live client on every build, which is the one of the three limits that could not
+     wait for the move to the generated client - the other two degrade a turn, this one scans
+     with a credential the operator has already replaced.
 
 The vocabulary is here too
 --------------------------
@@ -53,9 +58,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import aisecurity
+from aisecurity.constants.base import HEADER_API_KEY
 from aisecurity.exceptions import AISecSDKException
 from aisecurity.generated_openapi_client import AiProfile
 from aisecurity.generated_openapi_client.models.metadata import Metadata
+from aisecurity.scan.inline.scan_executor import ScanExecutor
 from aisecurity.scan.inline.scanner import Scanner
 from aisecurity.scan.models.content import Content
 
@@ -227,6 +234,47 @@ _DIRECTIONS = {
 }
 
 
+def _restamp_credentials(api_key: str, endpoint: str) -> None:
+    """Write the configured credential onto the live SDK client.
+
+    `aisecurity.init()` sets `global_configuration`, and `global_configuration` is read at exactly
+    one moment: when `ApiBase.create_api_client` builds the client. `ScanExecutor` is decorated
+    `@singleton`, so that moment happens once per PROCESS - the second `ScanExecutor()` returns the
+    cached instance without running `__init__` at all. Everything after it therefore calls the API
+    with whatever key was configured first.
+
+    That is not a cosmetic staleness. ApplyConfig is how a key is rotated, the push is accepted,
+    the console shows the new key stored, and the scans keep going out under the old one until
+    somebody restarts the daemon. A credential the operator has revoked is a credential this
+    appliance must stop using at the push, so the header is rewritten here rather than reported
+    as a limitation.
+
+    `ScanExecutor()` is called rather than reached for: it constructs the singleton on the first
+    build (reading the configuration init() just set, so the two agree) and returns that same
+    object on every build after. `set_default_header` and the `api_client` property are both
+    public on the generated client, so nothing here depends on the SDK's private shape - only on
+    the singleton being a singleton, which is the fact being worked around.
+
+    No lock. The dict assignment is atomic under the GIL, and a scan already in flight on another
+    worker carries whichever key it read - both are keys the appliance was configured with inside
+    the same second, and neither is the stale one a minute later.
+    """
+    client = ScanExecutor().api_client
+
+    previous = client.default_headers.get(HEADER_API_KEY)
+    client.set_default_header(HEADER_API_KEY, api_key)
+
+    # The endpoint is compiled in and does not move, but it is read from the same global at the
+    # same single moment, so it is restored on the same terms rather than left to be the next
+    # version of this bug.
+    client.configuration.host = endpoint
+
+    if previous is not None and previous != api_key:
+        # Never the key itself, and not its length either - the fact that it changed is the whole
+        # operational content, and it is the line that says the rotation took effect.
+        log.info("the AIRS API key changed - applied to the live scan client")
+
+
 class ApiApplicationGuardrail:
     """Calls the Prisma AIRS scan API, one request per checkpoint.
 
@@ -244,6 +292,12 @@ class ApiApplicationGuardrail:
         aisecurity.init(api_key=api_key, api_endpoint=endpoint, num_retries=NUM_RETRIES)
 
         self._scanner = Scanner()
+
+        # And again, onto the client that init() cannot reach. On the first build of a process
+        # this changes nothing; on every build after it is the only thing that makes a rotated
+        # key reach the wire.
+        _restamp_credentials(api_key, endpoint)
+
         self._profile = AiProfile(profile_name=profile_name)
         self._profile_name = profile_name
 
