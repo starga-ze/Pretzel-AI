@@ -191,7 +191,17 @@ message AiProvider {
   // 4, 5 retired: `enabled` and `url`. A provider is taken out of service by not being in the list,
   // which is how every other list in the appliance's configuration works; and the endpoint is a
   // fact about the vendor rather than a setting, so it is compiled in on this side — an operator
-  // cannot point "openai" at something that is not OpenAI.
+  // cannot point "openai" at something that is not OpenAI. The numbers stay spent rather than
+  // reused, so an old peer's frame is rejected instead of silently read as something else.
+
+  // Which name this vendor's output cap goes out under, for every model that does not say
+  // otherwise. 6 rather than 4 for the reason above.
+  //
+  // Here as well as on AiModel because it is a fact about the VENDOR: OpenAI renamed the parameter
+  // across a generation, so all sixty-one of their models answered the same way and running_config
+  // said it sixty-one times. A model that disagrees still carries its own and still wins — see
+  // AiModel.token_param — so this is the default, not the rule.
+  string token_param = 6;
 }
 
 // Which of the four points in a turn are inspected.

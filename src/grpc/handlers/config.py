@@ -70,6 +70,12 @@ def _document(request):
             {
                 "id": p.id,
                 "api_key": p.api_key,
+                # The vendor's default output-cap parameter, for every model that does not name its
+                # own. Written out like everything else here rather than picked up by a generic
+                # conversion - which is the point of this function, and also how it was missed: a
+                # field added to the proto reaches nothing until it is added to this list, and the
+                # symptom was a whole vendor falling back to max_tokens with nothing logged.
+                "token_param": p.token_param,
                 "models": [
                     {"id": m.id, "label": m.label, "token_param": m.token_param}
                     for m in p.models

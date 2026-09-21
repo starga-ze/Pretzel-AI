@@ -137,6 +137,14 @@ class ProviderConfig:
 
     provider_id: str = ""       # "openai" | "google" | "anthropic"
     api_key: str = ""
+
+    # Which name this vendor's output cap goes out under, for every model that does not say
+    # otherwise. Here rather than on each model because that is the granularity the fact actually
+    # has: OpenAI renamed it across a generation, so all sixty-one of their models carried the same
+    # string and running_config said it sixty-one times. A model that disagrees still overrides it
+    # - see ModelConfig.token_param and qualified_models below - so the exception stays expressible
+    # without the rule being repeated.
+    token_param: str = ""
     models: list = field(default_factory=list)      # list[ModelConfig]
 
     def endpoint(self) -> str:
@@ -247,7 +255,10 @@ class Config:
                 models.append({
                     "id": provider.provider_id + "/" + model.model_id,
                     "label": model.label or model.model_id,
-                    "token_param": model.token_param,
+                    # Model, then vendor, then the catalog's own default. A document written before
+                    # the vendor-level field existed says it on every model and still resolves to
+                    # the same answer here, so nothing has to be migrated.
+                    "token_param": model.token_param or provider.token_param,
                 })
         return models
 
@@ -278,16 +289,24 @@ class Config:
         for provider in self.providers:
             models = []
             for model in provider.models:
-                models.append({
+                entry = {
                     "id": model.model_id,
                     "label": model.label,
-                    "token_param": model.token_param,
-                })
-            providers.append({
+                }
+                # Written only where it is an exception. An empty string round-trips as an absence
+                # so the cache is the same shape the appliance pushes, rather than a version of it
+                # that says the rule again under every model.
+                if model.token_param:
+                    entry["token_param"] = model.token_param
+                models.append(entry)
+            entry = {
                 "id": provider.provider_id,
                 "api_key": provider.api_key,
                 "models": models,
-            })
+            }
+            if provider.token_param:
+                entry["token_param"] = provider.token_param
+            providers.append(entry)
 
         services = []
         for service in self.services.values():
@@ -378,6 +397,7 @@ def _provider_from(raw: dict) -> ProviderConfig:
     provider = ProviderConfig()
     provider.provider_id = raw.get("id") or ""
     provider.api_key = raw.get("api_key") or ""
+    provider.token_param = raw.get("token_param") or ""
 
     for raw_model in raw.get("models") or []:
         model = ModelConfig()
