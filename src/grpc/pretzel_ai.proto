@@ -371,6 +371,26 @@ message RefreshProgress {
   int32 survey_redirect = 11;
   int32 survey_missing  = 12;
 
+  // The page the crawl is on right now. A full run is forty minutes of a bar that moves once
+  // every fiftieth page, which is indistinguishable from a bar that has stopped - an operator
+  // watching this card cancelled a healthy crawl over exactly that. The URL is the cheapest
+  // proof the run is alive, and it says WHERE it is, which the counters never could.
+  //
+  // Sent on the survey too: that pass is one HEAD per URL and used to report nothing at all
+  // until it finished, so the first eighteen minutes of every run drew a frozen bar.
+  string current_url = 13;
+
+  // URLs the HEAD could not reach at all - a timeout, a reset, a refused connection. NOT the
+  // same as missing: nothing was learned about the page, so it stays in the crawl's worklist
+  // and the fetch decides. Reported because the other three buckets otherwise silently stop
+  // adding up to the number surveyed, and this card is read by people doing that arithmetic.
+  int32 survey_unknown = 14;
+
+  // 15 was survey_redirect_new, a derived count that existed only to explain the gap between
+  // the URLs surveyed and the pages fetched. The survey now probes those destinations itself,
+  // so they land in survey_ok or survey_missing and there is no gap left to explain.
+  reserved 15;
+
   bool   final  = 7;  // true exactly once, on the last message
   string error  = 8;
   int64  run_id = 9;
@@ -402,6 +422,11 @@ message CorpusStatus {
 message ListDocumentsRequest {
   string product = 1;
   string docset  = 2;   // "" means the product's top level
+
+  // A substring of a URL or a title. When set it is the whole request: the search runs across
+  // the corpus and product/docset are ignored, because someone who types a term is asking the
+  // corpus a question rather than narrowing the book they happen to have open.
+  string query = 3;
 }
 
 message DocumentSummary {
@@ -414,6 +439,11 @@ message DocumentSummary {
 message DocumentList {
   repeated DocumentSummary documents = 1;
   string error = 2;
+
+  // Matches before the cap. Equal to the length of `documents` except on a capped search, where
+  // the difference is the whole point: a console showing 200 rows out of 1,432 has to say so, or
+  // the operator reads the cap as the answer.
+  int32 total = 3;
 }
 
 // --- Benchmark sets ----------------------------------------------------------------------

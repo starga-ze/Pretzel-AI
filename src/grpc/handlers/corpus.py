@@ -18,24 +18,37 @@ _refresh_lock = threading.Lock()
 
 
 def _list_documents(servicer, request, context):
-    """Shared by the RPC below; kept apart so the error shape is written once."""
+    """→ (rows, total). Shared by the RPC below; kept apart so the error shape is written once.
+
+    Two questions through one call, told apart by `query`: browsing a book returns all of it and
+    `total` is just its length, while a search is capped and `total` is what it matched before
+    the cap.
+    """
     with corpus_store.connect() as conn:
-        return corpus_store.documents(conn, request.product, request.docset)
+        if request.query:
+            return corpus_store.search(conn, request.query)
+        rows = corpus_store.documents(conn, request.product, request.docset)
+        return rows, len(rows)
 
 def _progress_message(update):
     """pipeline.crawl's dict -> the wire message. Counts are absent on the earliest stages."""
     counts = update.get("counts") or {}
     survey = update.get("survey") or {}
+    # `listed` is the one field both halves of a run report, and it is carried in a different
+    # dict in each: the survey has not built `counts` yet, so reading it from there alone drew
+    # "68 gone of 0 listed" on the card for the whole survey.
     return pretzel_ai_pb2.RefreshProgress(
         stage=update.get("stage", ""),
         done=update.get("done", 0),
         total=update.get("total", 0),
-        listed=counts.get("listed", 0),
+        listed=counts.get("listed") or survey.get("listed", 0),
         stored=counts.get("stored", 0),
         rejected=counts.get("rejected", 0),
         survey_ok=survey.get("ok", 0),
         survey_redirect=survey.get("redirect", 0),
         survey_missing=survey.get("missing", 0),
+        survey_unknown=survey.get("unknown", 0),
+        current_url=update.get("current_url", "") or "",
         final=bool(update.get("final")),
         error=update.get("error", "") or "",
         run_id=update.get("run_id", 0) or 0,
@@ -73,14 +86,28 @@ class CorpusHandlers:
                                f"(started {in_flight[1]:%Y-%m-%d %H:%M})"))
                     return
 
-                for update in corpus_pipeline.crawl(conn, scope=scope):
-                    # The console closing its window cancels the crawl. Documented behaviour of
-                    # this card, not a failure: the operator was told to keep the window open, and
-                    # whatever was written stays written.
-                    if not context.is_active():
-                        log.info("RefreshCorpus cancelled by client")
-                        return
-                    yield _progress_message(update)
+                # Held in a name so it can be closed EXPLICITLY, which is the whole point.
+                # Returning out of the loop instead only drops the last reference: the `with`
+                # above closes the connection as this frame unwinds, and the generator's
+                # GeneratorExit handler - the one that marks the run cancelled - then runs
+                # against a closed connection and fails. Crawl #5 sat 'running' for ever that
+                # way, and a stuck row refuses every later crawl on the appliance.
+                progress = corpus_pipeline.crawl(conn, scope=scope)
+                try:
+                    for update in progress:
+                        # Cancel, or mgmtd going away. Not a failure either way, and whatever
+                        # was written stays written. The browser has no part in it: mgmtd holds
+                        # this stream and keeps the progress in a slot the console polls, so
+                        # closing that window leaves the crawl running. The call goes inactive
+                        # when mgmtd TryCancels it, which is what the card's Cancel asks for.
+                        if not context.is_active():
+                            log.info("RefreshCorpus cancelled by client")
+                            return
+                        yield _progress_message(update)
+                finally:
+                    # Covers the cancel above and any error thrown into this generator from
+                    # outside. Closing while `conn` is still open is what lets the run close out.
+                    progress.close()
         except Exception as exc:                    # noqa: BLE001 - reported to the console
             log.exception("RefreshCorpus failed")
             yield pretzel_ai_pb2.RefreshProgress(stage="failed", final=True, error=str(exc))
@@ -101,9 +128,10 @@ class CorpusHandlers:
 
     def ListDocuments(self, request, context):
         try:
-            rows = _list_documents(self, request, context)
+            rows, total = _list_documents(self, request, context)
         except Exception as exc:                    # noqa: BLE001 - reported to the console
             log.exception("ListDocuments failed")
             return pretzel_ai_pb2.DocumentList(error=str(exc))
         return pretzel_ai_pb2.DocumentList(
-            documents=[pretzel_ai_pb2.DocumentSummary(**row) for row in rows])
+            documents=[pretzel_ai_pb2.DocumentSummary(**row) for row in rows],
+            total=total)

@@ -1,20 +1,19 @@
-"""The sitemap: the whole crawl's worklist, and the first staleness gate.
+"""The sitemap: the whole crawl's worklist.
 
 docs.paloaltonetworks.com publishes one flat sitemap.xml (~4.4 MB, ~22.5k <url> entries) with a
-<lastmod> on every entry. That single fetch is what makes "check for updates" cheap: the crawler
-compares each lastmod against the one stored on techdoc.document and only the pages that moved
-are candidates for a re-fetch.
+<lastmod> on every entry. That single fetch is where a run gets its list of pages, and there is
+no incremental path for it to feed (see pipeline), so it is a worklist and nothing more.
 
-Two things the caller must know about that signal:
+Two things the caller must know about it:
 
   - Fragment URLs. The sitemap lists the same page once per in-page anchor, so 22,518 <loc>
     entries collapse to 21,768 real pages. Canonicalising away the fragment is not a tidy-up, it
     is what stops the crawler fetching some pages a dozen times.
 
-  - lastmod moves in batches. Entries share a timestamp to the second (24 pages on one, 20 on
-    another), which is a documentation set being republished wholesale rather than 24 pages being
-    edited. So lastmod means "republished", never "the text changed" — it is a cheap filter that
-    over-reports, and the content hash downstream is what actually decides.
+  - lastmod is carried through to the store and shown beside a document as the vendor's own
+    date. It gates nothing, and could not: entries share a timestamp to the second (24 pages on
+    one, 20 on another), which is a documentation set being republished wholesale rather than 24
+    pages being edited. It means "republished", never "the text changed".
 """
 
 import logging

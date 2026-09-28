@@ -1,13 +1,21 @@
 """techdoc.document: one row per URL, and nothing that is not a document.
 
-The store holds documents, not attempts. A page that 404s, redirects onto another page, renders to
-nothing, or has no title never reaches this module — `pipeline` drops it — so every column here is
-NOT NULL for a reason and the table cannot hold a half-record.
+Seven columns, flat: url (PK), title, text, content_sha, char_count, lastmod, fetched_at. The
+sha-keyed body table this schema started with is gone (009); a body lives inline on its row and
+the hash is a column beside it. sql/001 still describes the old shape and says so at the top.
 
-content_sha is stored but never joined on. Palo Alto ships the same section in several manuals
-(twenty hardware references share one "Third-Party Component Support" page), so ~20% of rows carry
-a body that is byte-identical to another's. Retrieval collapses those at ranking time; the hash is
-how it recognises them.
+The store holds documents, not attempts. A page that 404s, redirects onto another page, renders to
+nothing, or has no title never reaches this module — `pipeline` drops it — so the table cannot hold
+a half-record. One column is nullable and it is the exception that proves it: `lastmod` comes from
+the sitemap, and a page reached as a redirect target need not be listed there at all. A missing
+vendor timestamp is a fact about the sitemap, not a half-written document.
+
+content_sha carries the deduplication. Palo Alto ships the same section in several manuals (twenty
+hardware references share one "Third-Party Component Support" page), so ~21% of rows carry a body
+byte-identical to another's — 17,690 rows, 13,965 distinct bodies. Retrieval collapses those at
+ranking time. It is also the grain chunking and embedding must work at: keyed by URL they would
+embed one body twenty times and fill a top-k with the same text under different links.
+document_sha_idx exists for that join.
 """
 
 import hashlib
@@ -41,7 +49,22 @@ def sha256(text):
 
 
 def put(cur, url, title, text, lastmod):
-    """Insert or replace one document."""
+    """Insert or replace one document. A REPLACE is total, and that is the point.
+
+    Every column but the URL is overwritten with what this fetch found, so the row is always the
+    page as the site serves it now. There is no history and no previous version to fall back on:
+    the corpus mirrors the site rather than recording how it got here.
+
+    Two consequences worth knowing before building on this table:
+
+      * A fetch that FAILS writes nothing, so the old row survives the attempt — and survives
+        the crawl too: `drop_missing` is passed the URLs whose fetch errored alongside the ones
+        stored, precisely so a 403 does not read as a withdrawal. What does not survive is a
+        page that WAS read and found not to be a document.
+      * content_sha changes whenever the body does, which is exactly the signal for re-chunking
+        and re-embedding. Anything derived from a body and stored elsewhere is orphaned by this
+        statement, not updated by it.
+    """
     cur.execute(
         """
         INSERT INTO techdoc.document (url, title, text, content_sha, char_count, lastmod, fetched_at)
@@ -59,12 +82,56 @@ def put(cur, url, title, text, lastmod):
 
 
 def drop_missing(cur, keep_urls):
-    """Delete documents the sitemap no longer lists. → rows removed.
+    """Delete documents this crawl neither stored nor failed to read. → rows removed.
 
-    A full crawl is the whole truth about what exists, so anything not seen in it is gone. There is
-    no tombstone: a URL Palo Alto has withdrawn is not something the assistant should still cite.
+    A full crawl is the whole truth about what exists - but only about the pages it actually
+    read. `keep_urls` is therefore the stored URLs PLUS the ones whose fetch errored, because
+    those two are different answers:
+
+        stored          read, and it is a document
+        fetch errored   not read at all - 403, timeout, a shell response. Says nothing about
+                        whether the page exists, so it must not be grounds for deletion
+        rejected        read, and it is not a document - a landing page, a book cover, a page
+                        with no title. This IS an answer, so the row goes
+
+    Passing only the stored URLs meant a rate-limited run deleted good documents: sixteen went
+    on 2026-09-21 when another HEAD load ran beside the crawl and Palo Alto answered 403 to
+    pages that were serving normally minutes later. The failure is transient, the deletion was
+    not, and the log line below read the same as a genuine withdrawal.
+
+    There is no tombstone: a URL Palo Alto has withdrawn is not something the assistant should
+    still cite.
     """
     cur.execute("DELETE FROM techdoc.document WHERE NOT (url = ANY(%s))", (list(keep_urls),))
+    return cur.rowcount
+
+
+def prune_small_products(cur, minimum):
+    """Delete every document under a product that has fewer than `minimum` of them. → rows removed.
+
+    What this removes is not documentation. docs.paloaltonetworks.com puts a handful of one-page
+    trees beside the manuals - a locale index, a release-notes stub, a redirect target that kept
+    its own path - and each becomes a "product" in the browser holding a single page that answers
+    no question about it. A count rather than a name list because the names change with the site
+    and a hard-coded list would rot silently; a product that is really a manual has hundreds of
+    pages, and the nearest real one above this line has 29.
+
+    Run after drop_missing, and only on a full crawl: the count is over the whole table, so a run
+    scoped to one product would measure that product against a corpus it did not refresh.
+    """
+    cur.execute(
+        f"""
+        WITH counted AS (
+            SELECT url, {PRODUCT_SQL} AS product FROM techdoc.document
+        ),
+        small AS (
+            SELECT product FROM counted GROUP BY product HAVING count(*) < %s
+        )
+        DELETE FROM techdoc.document
+              WHERE url IN (SELECT url FROM counted WHERE product IN (SELECT product FROM small))
+        """,
+        (minimum,),
+    )
     return cur.rowcount
 
 
@@ -99,6 +166,12 @@ def status(conn):
     }
 
 
+# The product a URL implies: its first path segment. Written once because product_tree groups by
+# it and prune_small_products deletes by it, and two spellings of the same derivation would
+# disagree the day one of them is corrected.
+PRODUCT_SQL = "split_part(replace(url, 'https://docs.paloaltonetworks.com/', ''), '/', 1)"
+
+
 def product_tree(conn):
     """The corpus grouped by the product and book each URL implies.
 
@@ -106,10 +179,10 @@ def product_tree(conn):
     page sits, and a denormalised copy is one more thing that can drift out of agreement with it.
     """
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             WITH parts AS (
                 SELECT url, char_count, content_sha,
-                       split_part(replace(url, 'https://docs.paloaltonetworks.com/', ''), '/', 1) AS product,
+                       {PRODUCT_SQL} AS product,
                        split_part(replace(url, 'https://docs.paloaltonetworks.com/', ''), '/', 2) AS second
                   FROM techdoc.document
             )
@@ -224,3 +297,57 @@ def documents(conn, product, docset):
              "lastmod": r[3].isoformat() if r[3] else ""}
             for r in cur
         ]
+
+
+# A search answers while someone is typing, so it is capped rather than paged: row 201 is not
+# what the next keystroke wants, and a page-two button on a list that is about to be replaced is
+# a control nobody reaches. The count of what was cut is reported instead, which is the part an
+# operator actually needs — "200 of 1,432" says refine the term.
+SEARCH_LIMIT = 200
+
+
+def _literal_like(term):
+    """`term` as a LIKE pattern matching it literally, wildcards and all.
+
+    LIKE reads %, _ and backslash as syntax, so a term carrying one searches for something other
+    than itself: an operator typing "100%" matched every document in the corpus. Escaped into the
+    PARAMETER rather than the statement, which is why no ESCAPE clause is needed — backslash is
+    already LIKE's default escape character.
+    """
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def search(conn, query, limit=SEARCH_LIMIT):
+    """→ (rows, total). URL or title substring, case-insensitive, over the whole corpus.
+
+    Both columns, because neither answers alone. A term like "globalprotect" is a product and
+    lives in the path; "decryption profile" is a phrase from a title that the URL only carries as
+    a slug with the space removed. Searching one column would silently answer half the questions.
+
+    Whole corpus rather than within the open book: the tree is the way to narrow by product, and
+    a search that inherited whatever book was open would answer a different question depending on
+    where the reader happened to be standing.
+
+    ORDER BY url, so results arrive grouped by product and book — the same order the tree uses,
+    and the only one available: a substring match has no relevance to rank by.
+
+    `total` comes from a window function rather than a second COUNT query, so the number and the
+    rows are one statement and cannot disagree with each other.
+    """
+    pattern = _literal_like(query)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT url, title, char_count, lastmod, count(*) OVER () AS total
+              FROM techdoc.document
+             WHERE url ILIKE %s OR title ILIKE %s
+          ORDER BY url
+             LIMIT %s
+        """, (pattern, pattern, limit))
+        rows = cur.fetchall()
+    return (
+        [{"url": r[0], "title": r[1], "char_count": r[2],
+          "lastmod": r[3].isoformat() if r[3] else ""}
+         for r in rows],
+        rows[0][4] if rows else 0,
+    )

@@ -31,15 +31,25 @@ def cmd_crawl(args):
 
         for progress in pipeline.crawl(conn, scope=args.scope):
             if progress["stage"] == "survey":
-                print(f"  surveying {progress['total']:,} URLs (HEAD)…", flush=True)
+                # Same one-line redraw as the fetch below: the survey is eighteen minutes and
+                # a terminal that prints nothing for that long reads as a hang here too.
+                url = progress.get("current_url") or ""
+                if progress["done"]:
+                    print(f"\r  survey {progress['done']}/{progress['total']}  "
+                          f"{url[-58:]:<58}", end="", flush=True)
+                else:
+                    print(f"  surveying {progress['total']:,} URLs (HEAD)…", flush=True)
             elif progress["stage"] == "start":
                 sv = progress.get("survey") or {}
+                print()          # close the survey's one-line redraw before summarising it
                 print(f"  survey: {sv.get('ok',0):,} pages, {sv.get('redirect',0):,} redirect, "
                       f"{sv.get('missing',0):,} missing → {progress['total']:,} to fetch")
             elif progress["stage"] == "fetch":
                 c = progress["counts"]
+                url = (progress.get("current_url") or "")[-46:]
                 print(f"\r  {progress['done']}/{progress['total']}  "
-                      f"stored={c['stored']} rejected={c['rejected']}", end="", flush=True)
+                      f"stored={c['stored']} rejected={c['rejected']}  {url:<46}",
+                      end="", flush=True)
             elif progress["final"]:
                 print()
                 if progress["stage"] == "failed":

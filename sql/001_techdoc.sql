@@ -1,3 +1,26 @@
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+--  SUPERSEDED. This file is what the schema was on day one, kept because it is what ran.
+--  It is NOT what the database looks like now, and it is the first file a reader opens.
+--
+--    techdoc.content       DROPPED in 009. Bodies are inline in techdoc.document.text; the
+--                          sha is a column on that row, not a table it points at.
+--    techdoc.document      REPLACED in 008/009 by the flat seven-column table. Everything
+--                          below about product / version / docset / etag / last_modified /
+--                          http_status / fetch_error / deleted_at is gone - see 008 for why
+--                          each one went.
+--    techdoc.crawl_run     REPLACED in 009; skipped_304 and skipped_same_sha described
+--                          staleness gates that no longer exist.
+--
+--  So the header's claim below - "the foreign key from corpus into techdoc.content" - cannot
+--  be built: there is nothing to point at. Chunks key on techdoc.document.content_sha, which
+--  is what document_sha_idx is for, and which is also how ~21% of rows sharing a body get
+--  chunked and embedded once instead of twenty times.
+--
+--  For the shape that exists, read 008_flat_document.sql. The rest of this header - two
+--  lifecycles, corpus rebuilt outright when the rules change, one writer per database - is
+--  still the intent and still correct.
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+
 -- pretzel_knowledge — the tech-doc knowledge base behind the RAG assistant.
 --
 -- Two schemas, two owners, two lifecycles:
