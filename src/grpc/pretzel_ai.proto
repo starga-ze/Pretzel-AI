@@ -62,6 +62,10 @@ service PretzelAi {
   // bodies are what the assistant reads, not what an operator scrolls.
   rpc ListDocuments(ListDocumentsRequest) returns (DocumentList);
 
+  // What a refresh did not collect, and why. Read from the run's durable observations, so it
+  // answers for a finished run as readily as for the one in flight.
+  rpc ListCorpusExceptions(ListExceptionsRequest) returns (ExceptionList);
+
   // --- Benchmark sets ---------------------------------------------------------------------
   //
   // A set is one uploaded .jsonl. Several coexist: a result recorded last week was scored against
@@ -350,62 +354,54 @@ message ModelList {
 
 message RefreshCorpusRequest {
   string scope = 1;   // one product ("ngfw"); "" -> the whole sitemap
+  bool dry_run = 2;   // audit only; active corpus is unchanged
 }
 
-// Emitted every batch. `rejected` counts pages that were fetched and turned out not to be
-// documents — 404s, redirects onto a page already stored, bodies that render to nothing. They are
-// not shown to the operator individually: there is nothing to do about a page Palo Alto removed.
+// GET-based classification. Unknown and unavailable are distinct from non-documents.
 message RefreshProgress {
-  string stage = 1;   // survey | start | fetch | done | failed | cancelled
-  int32  done  = 2;
-  int32  total = 3;   // during survey: URLs listed. after it: pages actually to fetch.
+  string stage = 1;   // discover | fetch | reconcile | done | failed | cancelled
 
-  int32  listed   = 4;
-  int32  stored   = 5;
-  int32  rejected = 6;
+  // The three outcomes, spelled exactly as the decision column and the console's buckets spell
+  // them. One vocabulary end to end: a number here is a row count in techdoc.crawl_observation
+  // with that decision, and no translation table stands in between.
+  int32 collected = 5;   // read, and it is documentation
+  int32 excluded  = 6;   // read and ruled out, or the publisher has removed it
+  int32 unknown   = 16;  // not read. Nothing about the stored copy changes
 
-  // What the HEAD survey found, so the console can show a target the crawl can actually reach.
-  // The sitemap lists ~21,900 URLs; a fifth redirect onto a page it also lists and a few hundred
-  // are gone, which is why a bar drawn against the listed count never fills.
-  int32 survey_ok       = 10;
-  int32 survey_redirect = 11;
-  int32 survey_missing  = 12;
-
-  // The page the crawl is on right now. A full run is forty minutes of a bar that moves once
-  // every fiftieth page, which is indistinguishable from a bar that has stopped - an operator
-  // watching this card cancelled a healthy crawl over exactly that. The URL is the cheapest
-  // proof the run is alive, and it says WHERE it is, which the counters never could.
-  //
-  // Sent on the survey too: that pass is one HEAD per URL and used to report nothing at all
-  // until it finished, so the first eighteen minutes of every run drew a frozen bar.
+  int32 done  = 2;   // URLs visited so far; the progress bar's numerator
+  int32 total = 3;   // every URL this run will visit, which is what the sitemap offered
+  int32 listed = 4;  // the same number; kept because the coverage guard records it per run
+  bool final = 7;
+  string error = 8;
+  int64 run_id = 9;
   string current_url = 13;
 
-  // URLs the HEAD could not reach at all - a timeout, a reset, a refused connection. NOT the
-  // same as missing: nothing was learned about the page, so it stays in the crawl's worklist
-  // and the fetch decides. Reported because the other three buckets otherwise silently stop
-  // adding up to the number surveyed, and this card is read by people doing that arithmetic.
-  int32 survey_unknown = 14;
+  bool dry_run = 21;
 
-  // 15 was survey_redirect_new, a derived count that existed only to explain the gap between
-  // the URLs surveyed and the pages fetched. The survey now probes those destinations itself,
-  // so they land in survey_ok or survey_missing and there is no gap left to explain.
-  reserved 15;
-
-  bool   final  = 7;  // true exactly once, on the last message
-  string error  = 8;
-  int64  run_id = 9;
+  // 18, 19, 20, 22 were removed / candidates / warning / renames: a refresh used to reconcile
+  // with the corpus and had to report what it deleted and what it declined to. It now rebuilds -
+  // the newest run's collected set IS the corpus - so there is no removal to count and no
+  // deferral to explain, and the numbers on screen are the three outcomes and nothing else.
+  //
+  // 10, 11, 12, 14 were survey_ok / survey_redirect / survey_missing / survey_unknown, counters
+  // from the HEAD pass that no longer exists: one GET pass now resolves redirects and missing
+  // pages as it goes. They were still on the wire as zeroes long after nothing set them.
+  // 17 was `unavailable`, a fourth outcome that the console always showed beside non-documents
+  // because to a reader both mean "correctly not in the corpus". It is folded into `excluded`;
+  // what separated it survives where it belongs, as the reason http_404.
+  reserved 10, 11, 12, 14, 15, 17, 18, 19, 20, 22;
 }
 
 message CorpusStatusRequest {}
 
-// One row of the product/book tree, derived from the URL paths — docs.paloaltonetworks.com
-// publishes one flat sitemap with no hierarchy of its own.
+// One product/manual/version category. Version prefers vendor metadata.
 message ProductStat {
   string product   = 1;
   string docset    = 2;
   int32  documents = 3;
   int32  bodies    = 4;
   int64  chars     = 5;
+  string version = 6;
 }
 
 message CorpusStatus {
@@ -417,6 +413,8 @@ message CorpusStatus {
   int64  last_run_id     = 6;
   string error = 7;
   repeated ProductStat products = 8;
+  string last_run_summary = 9;
+  string last_run_error = 10;
 }
 
 message ListDocumentsRequest {
@@ -427,23 +425,63 @@ message ListDocumentsRequest {
   // the corpus and product/docset are ignored, because someone who types a term is asking the
   // corpus a question rather than narrowing the book they happen to have open.
   string query = 3;
+  optional string version = 4; // absent: all versions; empty: unversioned only
+  int32 offset = 5;
+  int32 limit = 6;
 }
 
 message DocumentSummary {
   string url        = 1;
   string title      = 2;
   int32  char_count = 3;
-  string lastmod    = 4;   // vendor's last edit, ISO-8601
+  string lastmod    = 4;   // vendor publication date, ISO-8601
+  string version = 5;
+  string information_type = 6;
+  string fetched_at = 7;
+  bool validated = 8;
 }
 
 message DocumentList {
   repeated DocumentSummary documents = 1;
   string error = 2;
 
-  // Matches before the cap. Equal to the length of `documents` except on a capped search, where
-  // the difference is the whole point: a console showing 200 rows out of 1,432 has to say so, or
-  // the operator reads the cap as the answer.
+  // Matches before pagination.
   int32 total = 3;
+}
+
+// Every URL a run looked at and did NOT collect, with the reason. The counts on the progress
+// card say how many; this says which, so an operator can open the page and judge for themselves
+// whether the crawler was right about it.
+message ListExceptionsRequest {
+  int64  run_id = 1;   // 0 means the most recent run
+  string reason = 2;   // "" means every exception
+  int32  offset = 3;
+  int32  limit  = 4;
+}
+
+message CorpusException {
+  string url         = 1;
+  string final_url   = 2;   // where the fetch ended, when a redirect moved it
+  string decision    = 3;   // non_document | unavailable | unknown
+  string reason      = 4;   // navigation_only, unsupported_template, http_404, …
+  int32  http_status = 5;
+  string detail      = 6;   // the transport error, when there was one
+}
+
+// One reason and how often it occurred in the whole run — not in the page being returned, so the
+// console can offer the reasons as filters without asking a second time.
+message ReasonTally {
+  string decision = 1;
+  string reason   = 2;
+  int32  count    = 3;
+}
+
+message ExceptionList {
+  repeated CorpusException exceptions = 1;
+  repeated ReasonTally     tally      = 2;
+  int64  run_id = 3;   // the run actually read, which matters when the request said 0
+  int32  total  = 4;   // matches before offset/limit
+  string error  = 5;
 }
 
 // --- Benchmark sets ----------------------------------------------------------------------

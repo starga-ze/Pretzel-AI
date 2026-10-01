@@ -1,353 +1,227 @@
-"""techdoc.document: one row per URL, and nothing that is not a document.
-
-Seven columns, flat: url (PK), title, text, content_sha, char_count, lastmod, fetched_at. The
-sha-keyed body table this schema started with is gone (009); a body lives inline on its row and
-the hash is a column beside it. sql/001 still describes the old shape and says so at the top.
-
-The store holds documents, not attempts. A page that 404s, redirects onto another page, renders to
-nothing, or has no title never reaches this module — `pipeline` drops it — so the table cannot hold
-a half-record. One column is nullable and it is the exception that proves it: `lastmod` comes from
-the sitemap, and a page reached as a redirect target need not be listed there at all. A missing
-vendor timestamp is a fact about the sitemap, not a half-written document.
-
-content_sha carries the deduplication. Palo Alto ships the same section in several manuals (twenty
-hardware references share one "Third-Party Component Support" page), so ~21% of rows carry a body
-byte-identical to another's — 17,690 rows, 13,965 distinct bodies. Retrieval collapses those at
-ranking time. It is also the grain chunking and embedding must work at: keyed by URL they would
-embed one body twenty times and fill a top-k with the same text under different links.
-document_sha_idx exists for that join.
-"""
-
+"""Active corpus, durable observations and reversible, evidence-based pruning."""
 import hashlib
-import logging
 import os
+from pathlib import Path
 
 import psycopg
+from psycopg.types.json import Jsonb
 
-log = logging.getLogger("pretzel-ai.crawler.store")
+from src.crawler.extract import PARSER_VERSION, COLLECTED, EXCLUDED, UNKNOWN, REASONS
+from src.crawler.sitemap import classify
 
-DSN_ENV = "PZ_KNOWLEDGE_DSN"
-DEFAULT_DSN = "host=127.0.0.1 port=5432 dbname=pretzel_knowledge user=pretzel"
+LOCK_ID = 740120182
 
 
 def dsn():
-    """The knowledge DB connection string. The password follows pretzel's own convention —
-    PZ_PG_PASSWORD, with the repo's localhost-only development default."""
-    configured = os.environ.get(DSN_ENV, "").strip()
-    if configured:
-        return configured
-    password = os.environ.get("PZ_PG_PASSWORD", "pretzel")
-    return f"{DEFAULT_DSN} password={password}"
+    return os.environ.get('PZ_KNOWLEDGE_DSN', '').strip() or (
+        'host=127.0.0.1 port=5432 dbname=pretzel_knowledge user=pretzel password=' +
+        os.environ.get('PZ_PG_PASSWORD', 'pretzel'))
 
 
 def connect():
-    return psycopg.connect(dsn())
+    return psycopg.connect(dsn(), connect_timeout=10, options='-c statement_timeout=30000 -c lock_timeout=5000')
 
 
-def sha256(text):
-    return hashlib.sha256(text.encode("utf-8")).digest()
+# Applied in order, and each is written to be safe to re-run, so `migrate` is the one command an
+# operator needs whatever state the database is in.
+MIGRATIONS = ('sql/018_corpus_lifecycle.sql', 'sql/019_outcome_vocabulary.sql',
+              'sql/020_rebuild_corpus.sql')
 
 
-def put(cur, url, title, text, lastmod):
-    """Insert or replace one document. A REPLACE is total, and that is the point.
+def migrate(conn):
+    root = Path(__file__).resolve().parents[2]
+    for name in MIGRATIONS:
+        conn.execute((root / name).read_text())
+        conn.commit()
 
-    Every column but the URL is overwritten with what this fetch found, so the row is always the
-    page as the site serves it now. There is no history and no previous version to fall back on:
-    the corpus mirrors the site rather than recording how it got here.
 
-    Two consequences worth knowing before building on this table:
+MIGRATION_NEEDED = 'Corpus migration required: python -m src.crawler migrate'
 
-      * A fetch that FAILS writes nothing, so the old row survives the attempt — and survives
-        the crawl too: `drop_missing` is passed the URLs whose fetch errored alongside the ones
-        stored, precisely so a 403 does not read as a withdrawal. What does not survive is a
-        page that WAS read and found not to be a document.
-      * content_sha changes whenever the body does, which is exactly the signal for re-chunking
-        and re-embedding. Anything derived from a body and stored elsewhere is orphaned by this
-        statement, not updated by it.
+
+def require_schema(conn):
+    """Refuse to start a run against a database older than the code writing to it.
+
+    Two things are checked, and the second exists because of what happened without it: renaming
+    the outcomes left the CHECK on `decision` still spelling them the old way, so a deploy that
+    skipped the migration started normally and died on the first page with a constraint violation
+    — a message about a CHECK, hundreds of fetches in, for a migration nobody had run. The
+    vocabulary is part of the contract, so it is verified with the table's existence.
     """
-    cur.execute(
-        """
-        INSERT INTO techdoc.document (url, title, text, content_sha, char_count, lastmod, fetched_at)
-             VALUES (%s, %s, %s, %s, %s, %s, now())
-        ON CONFLICT (url) DO UPDATE SET
-               title       = EXCLUDED.title,
-               text        = EXCLUDED.text,
-               content_sha = EXCLUDED.content_sha,
-               char_count  = EXCLUDED.char_count,
-               lastmod     = EXCLUDED.lastmod,
-               fetched_at  = now()
-        """,
-        (url, title, text, sha256(text), len(text), lastmod),
-    )
+    if not conn.execute("SELECT to_regclass('techdoc.crawl_observation')").fetchone()[0]:
+        raise RuntimeError(MIGRATION_NEEDED)
+    rule = conn.execute("""SELECT pg_get_constraintdef(oid) FROM pg_constraint
+         WHERE conrelid='techdoc.crawl_observation'::regclass
+           AND conname='crawl_observation_decision_check'""").fetchone()
+    if not rule or not all(word in rule[0] for word in (COLLECTED, EXCLUDED, UNKNOWN)):
+        raise RuntimeError(MIGRATION_NEEDED)
 
 
-def drop_missing(cur, keep_urls):
-    """Delete documents this crawl neither stored nor failed to read. → rows removed.
-
-    A full crawl is the whole truth about what exists - but only about the pages it actually
-    read. `keep_urls` is therefore the stored URLs PLUS the ones whose fetch errored, because
-    those two are different answers:
-
-        stored          read, and it is a document
-        fetch errored   not read at all - 403, timeout, a shell response. Says nothing about
-                        whether the page exists, so it must not be grounds for deletion
-        rejected        read, and it is not a document - a landing page, a book cover, a page
-                        with no title. This IS an answer, so the row goes
-
-    Passing only the stored URLs meant a rate-limited run deleted good documents: sixteen went
-    on 2026-09-21 when another HEAD load ran beside the crawl and Palo Alto answered 403 to
-    pages that were serving normally minutes later. The failure is transient, the deletion was
-    not, and the log line below read the same as a genuine withdrawal.
-
-    There is no tombstone: a URL Palo Alto has withdrawn is not something the assistant should
-    still cite.
-    """
-    cur.execute("DELETE FROM techdoc.document WHERE NOT (url = ANY(%s))", (list(keep_urls),))
-    return cur.rowcount
+def claim(conn, scope='', dry_run=False):
+    require_schema(conn)
+    if not conn.execute('SELECT pg_try_advisory_lock(%s)', (LOCK_ID,)).fetchone()[0]:
+        raise RuntimeError('A corpus update is already running')
+    try:
+        # Holding the session lock proves that no compatible crawler owns these old runs.
+        conn.execute("UPDATE techdoc.crawl_run SET status='failed', finished_at=now(), error='worker interrupted' WHERE status='running'")
+        row = conn.execute('INSERT INTO techdoc.crawl_run(scope, dry_run) VALUES (%s,%s) RETURNING id', (scope or '', dry_run)).fetchone()
+        conn.commit()
+        return row[0]
+    except BaseException:
+        conn.rollback()
+        release(conn)
+        raise
 
 
-def prune_small_products(cur, minimum):
-    """Delete every document under a product that has fewer than `minimum` of them. → rows removed.
-
-    What this removes is not documentation. docs.paloaltonetworks.com puts a handful of one-page
-    trees beside the manuals - a locale index, a release-notes stub, a redirect target that kept
-    its own path - and each becomes a "product" in the browser holding a single page that answers
-    no question about it. A count rather than a name list because the names change with the site
-    and a hard-coded list would rot silently; a product that is really a manual has hundreds of
-    pages, and the nearest real one above this line has 29.
-
-    Run after drop_missing, and only on a full crawl: the count is over the whole table, so a run
-    scoped to one product would measure that product against a corpus it did not refresh.
-    """
-    cur.execute(
-        f"""
-        WITH counted AS (
-            SELECT url, {PRODUCT_SQL} AS product FROM techdoc.document
-        ),
-        small AS (
-            SELECT product FROM counted GROUP BY product HAVING count(*) < %s
-        )
-        DELETE FROM techdoc.document
-              WHERE url IN (SELECT url FROM counted WHERE product IN (SELECT product FROM small))
-        """,
-        (minimum,),
-    )
-    return cur.rowcount
-
-
-def known_urls(conn):
-    with conn.cursor() as cur:
-        cur.execute("SELECT url FROM techdoc.document")
-        return {row[0] for row in cur}
-
-
-def status(conn):
-    """What the console card shows at rest."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT count(*), count(DISTINCT content_sha), coalesce(sum(char_count), 0),
-                   max(fetched_at)
-              FROM techdoc.document
-        """)
-        documents, bodies, chars, fetched = cur.fetchone()
-        cur.execute("""
-            SELECT id, coalesce(finished_at, started_at), status
-              FROM techdoc.crawl_run ORDER BY id DESC LIMIT 1
-        """)
-        run = cur.fetchone()
-    return {
-        "documents": documents or 0,
-        "bodies": bodies or 0,
-        "chars": int(chars or 0),
-        "last_run_id": run[0] if run else 0,
-        "last_run_at": (run[1].isoformat() if run and run[1]
-                        else fetched.isoformat() if fetched else ""),
-        "last_run_status": run[2] if run else "",
-    }
-
-
-# The product a URL implies: its first path segment. Written once because product_tree groups by
-# it and prune_small_products deletes by it, and two spellings of the same derivation would
-# disagree the day one of them is corrected.
-PRODUCT_SQL = "split_part(replace(url, 'https://docs.paloaltonetworks.com/', ''), '/', 1)"
-
-
-def product_tree(conn):
-    """The corpus grouped by the product and book each URL implies.
-
-    Derived in the query rather than stored in columns: the URL is the only authority on where a
-    page sits, and a denormalised copy is one more thing that can drift out of agreement with it.
-    """
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            WITH parts AS (
-                SELECT url, char_count, content_sha,
-                       {PRODUCT_SQL} AS product,
-                       split_part(replace(url, 'https://docs.paloaltonetworks.com/', ''), '/', 2) AS second
-                  FROM techdoc.document
-            )
-            SELECT product,
-                   CASE WHEN second ~ '^[0-9]+-[0-9]+$' THEN '' ELSE second END AS docset,
-                   count(*), count(DISTINCT content_sha), coalesce(sum(char_count), 0)
-              FROM parts
-             WHERE product <> ''
-          GROUP BY 1, 2
-          ORDER BY count(*) DESC
-        """)
-        return [
-            {"product": r[0], "docset": r[1], "documents": r[2], "bodies": r[3], "chars": int(r[4])}
-            for r in cur
-        ]
-
-
-def start_run(conn):
-    with conn.cursor() as cur:
-        cur.execute("INSERT INTO techdoc.crawl_run DEFAULT VALUES RETURNING id")
-        run_id = cur.fetchone()[0]
+def release(conn):
+    conn.execute('SELECT pg_advisory_unlock(%s)', (LOCK_ID,))
     conn.commit()
-    return run_id
+
+
+def heartbeat(conn, run_id, counts):
+    conn.execute('UPDATE techdoc.crawl_run SET heartbeat_at=now(), summary=%s WHERE id=%s', (Jsonb(counts), run_id))
+    conn.commit()
 
 
 def finish_run(conn, run_id, status_text, counts, error=None):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE techdoc.crawl_run
-               SET finished_at = now(), status = %s, error = %s,
-                   listed = %s, stored = %s, rejected = %s
-             WHERE id = %s
-            """,
-            (status_text, error, counts.get("listed", 0), counts.get("stored", 0),
-             counts.get("rejected", 0), run_id),
-        )
+    conn.execute('''UPDATE techdoc.crawl_run SET finished_at=now(), heartbeat_at=now(), status=%s,
+        listed=%s, stored=%s, rejected=%s, summary=%s, error=%s WHERE id=%s''',
+        (status_text, counts.get('listed', 0), counts.get('stored', 0), counts.get('rejected', 0), Jsonb(counts), error, run_id))
     conn.commit()
-
-
-# A crawl that has reported nothing for this long is not running any more. Generous against the
-# survey pass, which is a single sweep of HEADs and reports only when it finishes.
-STALE_AFTER = "30 minutes"
-
-
-def reap_stale_runs(conn):
-    """Close out runs whose process died without saying so. → rows closed.
-
-    start_run() writes the row before the crawl reports anything, so a process killed in between
-    leaves a row marked running that nothing will ever finish — and the database-level guard then
-    refuses every later crawl as "already running". The guard is right; what was missing is anyone
-    noticing the claimant is gone.
-
-    Judged by silence rather than by a process check: the claimant may be the CLI or the gRPC
-    service, on this host or not, and "has not written a document in half an hour" is true of a
-    dead crawl however it died.
-    """
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            UPDATE techdoc.crawl_run
-               SET status = 'failed', finished_at = now(),
-                   error = 'no progress reported; the crawl process is gone'
-             WHERE status = 'running'
-               AND started_at < now() - interval '{STALE_AFTER}'
-               AND NOT EXISTS (
-                   SELECT 1 FROM techdoc.document
-                    WHERE fetched_at > now() - interval '{STALE_AFTER}')
-        """)
-        closed = cur.rowcount
-    conn.commit()
-    return closed
 
 
 def running_run(conn):
-    """→ (id, started_at) of a crawl already in flight, or None. Checked in the database because
-    the CLI and the gRPC service are two processes writing the same schema.
+    # Informational only. The authoritative cross-process gate is claim's advisory lock.
+    return conn.execute("SELECT id, started_at FROM techdoc.crawl_run WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
 
-    Stale claims are reaped first, so a crawl killed mid-run does not lock the appliance out of
-    every later one.
+
+def observe(cur, run_id, result):
+    cur.execute('''INSERT INTO techdoc.crawl_observation(run_id,url,final_url,decision,reason,http_status,detail)
+        VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (run_id,url) DO UPDATE SET
+        final_url=EXCLUDED.final_url, decision=EXCLUDED.decision, reason=EXCLUDED.reason,
+        http_status=EXCLUDED.http_status, detail=EXCLUDED.detail''',
+        (run_id, result.url, result.final_url or result.url, result.decision, result.reason, result.status, result.error[:1000]))
+
+
+def sha256(text):
+    return hashlib.sha256(text.encode('utf-8')).digest()
+
+
+def put(cur, run_id, url, title, text, lastmod, metadata=None):
+    """Write one document, stamped with the run that collected it.
+
+    `run_id` is what makes a refresh a rebuild: rows carry the run they came from, so the rows a
+    finished run did not write can be dropped in one statement (see retain_only) instead of being
+    reasoned about one at a time.
     """
-    reap_stale_runs(conn)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, started_at FROM techdoc.crawl_run
-             WHERE status = 'running' ORDER BY id DESC LIMIT 1
-        """)
-        return cur.fetchone()
+    parts = classify(url)
+    metadata = metadata or {}
+    version = metadata.get('os version') or (parts['version'] or '').replace('-', '.')
+    cur.execute('''INSERT INTO techdoc.document
+        (url,title,text,content_sha,char_count,lastmod,fetched_at,product,docset,version,information_type,parser_version,run_id)
+        VALUES (%s,%s,%s,%s,%s,%s,now(),%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (url) DO UPDATE SET title=EXCLUDED.title,text=EXCLUDED.text,
+        content_sha=EXCLUDED.content_sha,char_count=EXCLUDED.char_count,lastmod=EXCLUDED.lastmod,
+        fetched_at=now(),product=EXCLUDED.product,docset=EXCLUDED.docset,version=EXCLUDED.version,
+        information_type=EXCLUDED.information_type,parser_version=EXCLUDED.parser_version,
+        run_id=EXCLUDED.run_id''',
+        (url,title,text,sha256(text),len(text),lastmod,parts['product'],parts['docset'],version,
+         metadata.get('information type', ''),PARSER_VERSION,run_id))
 
 
-def documents(conn, product, docset):
-    """Titles and URLs under one product/book, for the corpus browser.
+def retain_only(cur, run_id, scope=None):
+    """Drop every document this run did not collect. → rows removed.
 
-    The same path split the tree uses, applied as a filter. Bodies are deliberately not returned:
-    they run to five megabytes and nothing in the browser reads them.
+    The swap at the end of a rebuild. One statement, inside the run's transaction, so the table
+    never holds half of one corpus and half of another; and only at the end, so a crawl that dies
+    at page 9,000 leaves the previous corpus exactly as it found it.
+
+    A scoped run may only empty its own product. Without that clause, refreshing one product would
+    delete every other one — the rows are not the run's, but they were never its business either.
     """
-    with conn.cursor() as cur:
-        cur.execute("""
-            WITH parts AS (
-                SELECT url, title, char_count, lastmod,
-                       split_part(replace(url, 'https://docs.paloaltonetworks.com/', ''), '/', 1) AS product,
-                       split_part(replace(url, 'https://docs.paloaltonetworks.com/', ''), '/', 2) AS second
-                  FROM techdoc.document
-            )
-            SELECT url, title, char_count, lastmod
-              FROM parts
-             WHERE product = %s
-               AND CASE WHEN second ~ '^[0-9]+-[0-9]+$' THEN '' ELSE second END = %s
-          ORDER BY url
-        """, (product, docset or ""))
-        return [
-            {"url": r[0], "title": r[1], "char_count": r[2],
-             "lastmod": r[3].isoformat() if r[3] else ""}
-            for r in cur
-        ]
+    cur.execute('DELETE FROM techdoc.document WHERE run_id <> %s AND (%s = \'\' OR product = %s)',
+                (run_id, scope or '', scope or ''))
+    return cur.rowcount
 
 
-# A search answers while someone is typing, so it is capped rather than paged: row 201 is not
-# what the next keystroke wants, and a page-two button on a list that is about to be replaced is
-# a control nobody reaches. The count of what was cut is reported instead, which is the part an
-# operator actually needs — "200 of 1,432" says refine the term.
-SEARCH_LIMIT = 200
+
+def previous_listed(conn, scope):
+    """How many pages the last healthy run of this scope was offered. Feeds the coverage guard."""
+    row = conn.execute("SELECT listed FROM techdoc.crawl_run WHERE scope=%s AND NOT dry_run AND status='ok' ORDER BY id DESC LIMIT 1", (scope or '',)).fetchone()
+    return row[0] if row else 0
 
 
-def _literal_like(term):
-    """`term` as a LIKE pattern matching it literally, wildcards and all.
 
-    LIKE reads %, _ and backslash as syntax, so a term carrying one searches for something other
-    than itself: an operator typing "100%" matched every document in the corpus. Escaped into the
-    PARAMETER rather than the statement, which is why no ESCAPE clause is needed — backslash is
-    already LIKE's default escape character.
+
+def status(conn):
+    require_schema(conn)
+    count,bodies,chars = conn.execute('SELECT count(*),count(DISTINCT content_sha),coalesce(sum(char_count),0) FROM techdoc.document').fetchone()
+    row = conn.execute('SELECT id,coalesce(finished_at,started_at),status,summary,error FROM techdoc.crawl_run ORDER BY id DESC LIMIT 1').fetchone()
+    return dict(documents=count,bodies=bodies,chars=int(chars),last_run_id=row[0] if row else 0,
+        last_run_at=row[1].isoformat() if row else '',last_run_status=row[2] if row else '',
+        last_run_summary=__import__('json').dumps(row[3]) if row else '',last_run_error=(row[4] or '') if row else '')
+
+
+def product_tree(conn):
+    return [dict(product=r[0],docset=r[1],version=r[2],documents=r[3],bodies=r[4],chars=int(r[5]))
+        for r in conn.execute('''SELECT product,docset,version,count(*),count(DISTINCT content_sha),sum(char_count)
+            FROM techdoc.document GROUP BY product,docset,version ORDER BY product,docset,version DESC''')]
+
+
+def exceptions(conn, run_id=0, reason='', offset=0, limit=100):
+    """→ (rows, total, tally, run_id). Every URL a run looked at and did not collect.
+
+    An exception is any decision other than `document`. The three that remain say different
+    things and are deliberately not merged here — `non_document` is a verdict about the page,
+    `unavailable` is the publisher having removed it, and `unknown` is this crawler failing to
+    read it. Only the last is a defect on our side, and telling them apart is the whole reason
+    an operator opens this list.
+
+    `run_id=0` reads the newest run, which is what a console asking "what just happened" means.
+    The tally counts the whole run rather than the page being returned, so the reasons can be
+    offered as filters without a second round trip.
+
+    Newest first, and that is load-bearing while a run is still going. A crawl walks its worklist
+    in URL order, so ordering this the same way pinned the page to the alphabetical head of the
+    run: once the exceptions passed the limit, the rows froze on the `a`s and nothing found
+    afterwards could ever enter the window. Most recent first means the page always shows what
+    just happened, which is the only reason to have it open mid-run.
     """
-    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{escaped}%"
+    run_id = run_id or (conn.execute('SELECT max(id) FROM techdoc.crawl_run').fetchone()[0] or 0)
+    counted = {(r[0], r[1]): r[2] for r in conn.execute(
+        """SELECT decision, reason, count(*) FROM techdoc.crawl_observation
+            WHERE run_id=%s AND decision<>%s GROUP BY 1,2""", (run_id, COLLECTED))}
+    # The whole vocabulary, not only what this run hit, so a reason at zero reads as "checked, and
+    # it did not happen" rather than disappearing. Anything the database holds that the catalogue
+    # does not know is appended, so a reason added in code shows up before it is catalogued.
+    tally = [dict(decision=bucket, reason=name, count=counted.pop((bucket, name), 0))
+             for name, bucket in REASONS.items() if bucket != COLLECTED]
+    tally += [dict(decision=d, reason=r, count=n) for (d, r), n in counted.items()]
+    tally.sort(key=lambda row: (-row['count'], row['reason']))
+    rows = conn.execute(
+        """SELECT url, final_url, decision, reason, http_status, detail, count(*) OVER ()
+             FROM techdoc.crawl_observation
+            WHERE run_id=%s AND decision<>%s AND (%s='' OR reason=%s)
+         ORDER BY observed_at DESC, url LIMIT %s OFFSET %s""",
+        (run_id, COLLECTED, reason, reason, min(max(limit or 100, 1), 500), max(offset, 0))).fetchall()
+    items = [dict(url=r[0], final_url=r[1], decision=r[2], reason=r[3],
+                  http_status=r[4], detail=r[5]) for r in rows]
+    return items, (rows[0][6] if rows else 0), tally, run_id
 
 
-def search(conn, query, limit=SEARCH_LIMIT):
-    """→ (rows, total). URL or title substring, case-insensitive, over the whole corpus.
+def _literal_like(query):
+    return '%' + query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_') + '%'
 
-    Both columns, because neither answers alone. A term like "globalprotect" is a product and
-    lives in the path; "decryption profile" is a phrase from a title that the URL only carries as
-    a slug with the space removed. Searching one column would silently answer half the questions.
 
-    Whole corpus rather than within the open book: the tree is the way to narrow by product, and
-    a search that inherited whatever book was open would answer a different question depending on
-    where the reader happened to be standing.
-
-    ORDER BY url, so results arrive grouped by product and book — the same order the tree uses,
-    and the only one available: a substring match has no relevance to rank by.
-
-    `total` comes from a window function rather than a second COUNT query, so the number and the
-    rows are one statement and cannot disagree with each other.
-    """
-    pattern = _literal_like(query)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT url, title, char_count, lastmod, count(*) OVER () AS total
-              FROM techdoc.document
-             WHERE url ILIKE %s OR title ILIKE %s
-          ORDER BY url
-             LIMIT %s
-        """, (pattern, pattern, limit))
-        rows = cur.fetchall()
-    return (
-        [{"url": r[0], "title": r[1], "char_count": r[2],
-          "lastmod": r[3].isoformat() if r[3] else ""}
-         for r in rows],
-        rows[0][4] if rows else 0,
-    )
+def documents(conn, product='', docset='', query='', version=None, offset=0, limit=100):
+    limit = min(max(limit or 100,1),200)
+    offset = max(offset,0)
+    pattern = _literal_like(query.strip())
+    rows = conn.execute('''SELECT url,title,char_count,lastmod,version,information_type,fetched_at,parser_version,count(*) OVER ()
+        FROM techdoc.document WHERE
+        ((%s<>'' AND (url ILIKE %s OR title ILIKE %s)) OR
+         (%s='' AND product=%s AND docset=%s AND (%s OR version=%s)))
+        ORDER BY url LIMIT %s OFFSET %s''',
+        (query,pattern,pattern,query,product,docset,version is None,version or '',limit,offset)).fetchall()
+    items = [dict(url=r[0],title=r[1],char_count=r[2],lastmod=r[3].isoformat() if r[3] else '',
+        version=r[4],information_type=r[5],fetched_at=r[6].isoformat(),validated=bool(r[7])) for r in rows]
+    return items, rows[0][8] if rows else 0

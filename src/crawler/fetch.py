@@ -1,154 +1,162 @@
-"""Fetching a page, and knowing when not to.
-
-Unconditional. There is no incremental crawl to support, so nothing is remembered between runs and
-there is nothing to make a request conditional on. (Both cache validators this site offers were
-tried: ETag changes on every request for the same unchanged page, so If-None-Match never matches;
-If-Modified-Since does work, and paid for itself only while the crawl was incremental.)
-
-The retry policy exists for one specific failure. A page can answer 200 with the site chrome
-intact and the content root missing; the same URL fetched again returns the real body. Because it
-is a 200 nothing about the HTTP layer looks wrong, so without an explicit content check the shell
-is stored and then dropped downstream as an empty document, silently. Here a missing content root
-is a retryable failure like a 503, and a page that fails it on every attempt is recorded with an
-error rather than written as empty.
-"""
-
-import logging
+"""Bounded GETs, same-host redirects, cooperative cancellation and shared throttling."""
 import random
+import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin
 
-from src.crawler.extract import NoContentRoot, extract, title_of
+from src.crawler.extract import analyze, EXCLUDED, UNKNOWN
 from src.crawler.sitemap import canonical
 
-log = logging.getLogger("pretzel-ai.crawler.fetch")
+# The publisher having removed a page is the one exclusion that needs corroborating before it may
+# delete anything: a 404 can be a deploy halfway through. Every other exclusion was read and
+# judged, and that reading is the evidence. Named here because these are the reasons this module
+# produces, and read by the pipeline when it decides what a run may remove.
+MISSING_REASONS = frozenset({'http_404', 'http_410'})
 
-USER_AGENT = "pz-pretzel-ai/1.0 (+tech-doc indexer)"
+USER_AGENT = 'pz-pretzel-ai/2.0 (+tech-doc indexer)'
 MAX_ATTEMPTS = 3
-BACKOFF_BASE = 1.5
-
-# Statuses that mean "you are going too fast", not "this page is unavailable".
-#
-# 403 belongs here, which is not obvious and was got wrong once: a full crawl recorded 155 of them,
-# concentrated in end-of-life PAN-OS versions, which reads exactly like a vendor locking retired
-# documentation. Re-requesting a sample of those URLs afterwards returned 200 or 301 for every one
-# of them — the concentration was an artifact of crawl order, and the site was rate-limiting eight
-# concurrent workers. Treating 403 as settled would have permanently dropped pages that are simply
-# behind a throttle.
-THROTTLE_STATUSES = frozenset({403, 429, 503})
-
-# Throttling is answered by waiting longer, not by trying sooner. Separate from BACKOFF_BASE so a
-# transient network error still retries quickly.
-THROTTLE_BACKOFF_BASE = 4.0
+MAX_BYTES = 16 * 1024 * 1024
+_lock = threading.Lock()
+_next_request = 0.0
 
 
-class Result:
-    """One fetch outcome. `status` is the HTTP code; 0 means the request never completed."""
+class Cancelled(Exception):
+    pass
 
-    __slots__ = ("url", "final_url", "status", "text", "title", "root", "error")
 
-    def __init__(self, url, status=0, text=None, title=None, root=None, error=None,
-                 final_url=None):
-        self.url = url
-        # Where the request actually ended. Whole subtrees of this site 301 onto one page, and
-        # urllib follows without saying so; without this the store records a body under a URL that
-        # never served it.
-        self.final_url = final_url or url
+class FetchError(Exception):
+    def __init__(self, message, status=0):
+        super().__init__(message)
         self.status = status
-        self.text = text
-        self.title = title
-        self.root = root
-        self.error = error
-
-    @property
-    def ok(self):
-        return self.error is None and self.text is not None
-
-    def __repr__(self):
-        state = (f"{self.status} {len(self.text)}c" if self.text is not None
-                 else f"ERR {self.error}")
-        return f"<Result {self.url} {state}>"
 
 
-def _request(url, timeout):
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-
-    request = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read().decode("utf-8", "replace")
-        return response.status, body, response.headers, response.geturl()
+class _Redirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Check BEFORE issuing a redirected request, not after downloading an arbitrary host.
+        newurl = canonical(urljoin(req.full_url, newurl))
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """An opener that reports a redirect instead of following it."""
+@dataclass
+class Result:
+    url: str
+    final_url: str = ''
+    status: int = 0
+    decision: str = UNKNOWN
+    reason: str = ''
+    title: str = ''
+    text: str = ''
+    metadata: dict = field(default_factory=dict)
+    error: str = ''
 
-    def redirect_request(self, *args, **kwargs):
-        return None
+
+def check(cancel):
+    if cancel and cancel.is_set():
+        raise Cancelled()
 
 
-_probe_opener = urllib.request.build_opener(_NoRedirect)
+def pause(seconds, cancel):
+    if cancel:
+        if cancel.wait(seconds):
+            raise Cancelled()
+    else:
+        time.sleep(seconds)
 
 
-def probe(url, timeout=15):
-    """→ (status, location). A HEAD that does not follow redirects.
+def throttle(cancel):
+    global _next_request
+    while True:
+        check(cancel)
+        with _lock:
+            delay = _next_request - time.monotonic()
+            if delay <= 0:
+                _next_request = time.monotonic() + 0.2
+                return
+        pause(min(delay, 1), cancel)
 
-    Used before a crawl to find out what the sitemap's URLs really are: how many are pages, how
-    many redirect onto a page already listed, how many are gone. That count is what the console
-    shows as the target — a progress bar out of 21,916 when 4,300 of those collapse and 260 do not
-    exist is a bar that never reaches its own end.
 
-    HEAD rather than GET because it answers the same question without the body: 20 pages/second
-    against 6, and this pass exists to save time rather than spend it.
-    """
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
+def retry_after(value):
     try:
-        with _probe_opener.open(request, timeout=timeout) as response:
-            return response.status, None
-    except urllib.error.HTTPError as e:
-        return e.code, e.headers.get("Location")
-    except (urllib.error.URLError, OSError, TimeoutError):
-        # Unreachable now says nothing about whether the page exists; the crawl will find out.
-        return 0, None
-
-
-def fetch(url, timeout=30):
-    """→ Result. Retries transient failures and shell responses; never raises for a bad page."""
-    last_error = None
-    status = 0
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        throttled = False
+        return min(120, max(0, float(value)))
+    except (TypeError, ValueError):
         try:
-            status, body, headers, final_url = _request(url, timeout)
-        except urllib.error.HTTPError as e:
-            # 404/410 are settled answers: the page is gone and retrying cannot change that.
-            if e.code in (404, 410):
-                return Result(url, status=e.code, error=f"HTTP {e.code}")
-            last_error = f"HTTP {e.code}"
-            status = e.code
-            if e.code in THROTTLE_STATUSES:
-                throttled = True
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
-            last_error = str(getattr(e, "reason", e)) or e.__class__.__name__
-        else:
-            try:
-                root, text = extract(body)
-            except NoContentRoot as e:
-                # The shell response. Retryable precisely because it is indistinguishable from
-                # success at the HTTP layer.
-                last_error = f"no usable body ({e})"
-                log.debug("no usable body on attempt %d: %s (%s)", attempt, url, e)
-            else:
-                return Result(url, status=status, text=text, title=title_of(body), root=root,
-                              # Normalised: a redirect Location on this site can carry an empty
-                              # path segment (ngfw/networking//session-settings).
-                              final_url=canonical(final_url))
+            return min(120, max(0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()))
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
-        if attempt < MAX_ATTEMPTS:
-            # Jittered so a documentation set that fails together does not retry in lockstep.
-            base = THROTTLE_BACKOFF_BASE if throttled else BACKOFF_BASE
-            time.sleep(base ** attempt + random.uniform(0, 0.4))
 
-    log.warning("giving up on %s after %d attempts: %s", url, MAX_ATTEMPTS, last_error)
-    return Result(url, status=status, error=last_error)
+def download(url, timeout=20, cancel=None, xml=False):
+    global _next_request
+    url = canonical(url)
+    opener = urllib.request.build_opener(_Redirect)
+    for attempt in range(MAX_ATTEMPTS):
+        throttle(cancel)
+        retry = 0
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT,
+                'Accept': 'application/xml,text/xml' if xml else 'text/html,application/xhtml+xml'})
+            with opener.open(req, timeout=timeout) as response:
+                status = response.status
+                final = canonical(response.geturl())
+                if status != 200:
+                    raise FetchError('unexpected HTTP ' + str(status), status)
+                mime = response.headers.get_content_type()
+                if not xml and mime not in ('text/html', 'application/xhtml+xml'):
+                    raise FetchError('unsupported content type: ' + mime)
+                chunks, size = [], 0
+                deadline = time.monotonic() + 60
+                while True:
+                    check(cancel)
+                    if time.monotonic() > deadline:
+                        raise FetchError('response body deadline exceeded')
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        raise FetchError('response exceeds size limit')
+                    chunks.append(chunk)
+                return status, b''.join(chunks).decode(response.headers.get_content_charset() or 'utf-8', 'replace'), final
+        except urllib.error.HTTPError as exc:
+            if exc.code in (404, 410):
+                return exc.code, '', canonical(exc.geturl())
+            if exc.code not in (403, 408, 429, 500, 502, 503, 504):
+                raise FetchError('HTTP ' + str(exc.code), exc.code) from exc
+            retry = max(retry_after(exc.headers.get('Retry-After')), 2 ** (attempt + 1))
+            with _lock:
+                _next_request = max(_next_request, time.monotonic() + retry)
+            error = 'HTTP ' + str(exc.code)
+            error_status = exc.code
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            error = str(exc)
+            error_status = 0
+        if attempt == MAX_ATTEMPTS - 1:
+            raise FetchError(error, error_status)
+        pause(max(retry, 2 ** attempt) + random.uniform(0, .3), cancel)
+
+
+def fetch(url, cancel=None):
+    result = Result(url=url, final_url=url)
+    try:
+        for attempt in range(2):
+            result.status, markup, result.final_url = download(url, cancel=cancel)
+            if result.status in (404, 410):
+                result.decision, result.reason = EXCLUDED, 'http_' + str(result.status)
+                return result
+            doc = analyze(markup, result.final_url)
+            result.decision, result.reason = doc.decision, doc.reason
+            result.title, result.text, result.metadata = doc.title, doc.text, doc.metadata
+            if doc.reason != 'content_root_missing' or attempt:
+                return result
+            pause(2, cancel)
+    except Cancelled:
+        raise
+    except (FetchError, ValueError, urllib.error.URLError, OSError, TimeoutError) as exc:
+        result.decision, result.reason, result.error = UNKNOWN, 'fetch_failed', str(exc)
+        result.status = getattr(exc, 'status', result.status)
+    return result

@@ -51,3 +51,6 @@ portkey-ai==2.3.4
 # before it as context, so a single-element wrapper gives up the ability to send conversation
 # context with a scan. The models are worth taking; that wrapper is not.
 pan-aisecurity==0.11.0
+
+# DOM-based technical document extraction
+beautifulsoup4==4.13.5

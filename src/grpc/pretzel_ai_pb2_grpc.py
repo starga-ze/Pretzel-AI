@@ -2,6 +2,12 @@
 """Client and server classes corresponding to protobuf-defined services."""
 import grpc
 
+# HAND-PATCHED, and protoc overwrites it every single time. The generator emits a top-level
+# `import pretzel_ai_pb2`, but these files live inside the `src.grpc` package, so that spelling
+# raises ModuleNotFoundError at startup — under systemd's restart loop it reads like a config
+# fault rather than an import one. After any regeneration, put this line back and check the
+# daemon imports before restarting the unit:
+#     .venv/bin/python3 -c "import sys; sys.path.insert(0,'.'); from src.process.core import Core"
 from src.grpc import pretzel_ai_pb2 as pretzel__ai__pb2
 
 
@@ -48,6 +54,11 @@ class PretzelAiStub(object):
                 '/pretzel.ai.v1.PretzelAi/ListDocuments',
                 request_serializer=pretzel__ai__pb2.ListDocumentsRequest.SerializeToString,
                 response_deserializer=pretzel__ai__pb2.DocumentList.FromString,
+                )
+        self.ListCorpusExceptions = channel.unary_unary(
+                '/pretzel.ai.v1.PretzelAi/ListCorpusExceptions',
+                request_serializer=pretzel__ai__pb2.ListExceptionsRequest.SerializeToString,
+                response_deserializer=pretzel__ai__pb2.ExceptionList.FromString,
                 )
         self.ListBenchmarkDatasets = channel.unary_unary(
                 '/pretzel.ai.v1.PretzelAi/ListBenchmarkDatasets',
@@ -197,6 +208,14 @@ class PretzelAiServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListCorpusExceptions(self, request, context):
+        """What a refresh did not collect, and why. Read from the run's durable observations, so it
+        answers for a finished run as readily as for the one in flight.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ListBenchmarkDatasets(self, request, context):
         """--- Benchmark sets ---------------------------------------------------------------------
 
@@ -331,6 +350,11 @@ def add_PretzelAiServicer_to_server(servicer, server):
                     servicer.ListDocuments,
                     request_deserializer=pretzel__ai__pb2.ListDocumentsRequest.FromString,
                     response_serializer=pretzel__ai__pb2.DocumentList.SerializeToString,
+            ),
+            'ListCorpusExceptions': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListCorpusExceptions,
+                    request_deserializer=pretzel__ai__pb2.ListExceptionsRequest.FromString,
+                    response_serializer=pretzel__ai__pb2.ExceptionList.SerializeToString,
             ),
             'ListBenchmarkDatasets': grpc.unary_unary_rpc_method_handler(
                     servicer.ListBenchmarkDatasets,
@@ -506,6 +530,23 @@ class PretzelAi(object):
         return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListDocuments',
             pretzel__ai__pb2.ListDocumentsRequest.SerializeToString,
             pretzel__ai__pb2.DocumentList.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def ListCorpusExceptions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/pretzel.ai.v1.PretzelAi/ListCorpusExceptions',
+            pretzel__ai__pb2.ListExceptionsRequest.SerializeToString,
+            pretzel__ai__pb2.ExceptionList.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
 
