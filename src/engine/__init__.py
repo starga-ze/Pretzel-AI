@@ -177,11 +177,15 @@ class Engine:
         """
         message = (message or "").strip()
         if not message:
+            log.warning("turn refused: code=BAD_REQUEST error=message is required")
             return None, None, TurnResult(ok=False, code="BAD_REQUEST",
                                           error="message is required")
 
         model_id, error = self.catalog.resolve(model)
         if error:
+            # The requested spelling, not the resolved one - there isn't a resolved one, and the
+            # spelling the caller sent is the thing to go and look at.
+            log.warning("turn refused: code=BAD_REQUEST model=%s error=%s", model or "-", error)
             return None, None, TurnResult(ok=False, code="BAD_REQUEST", error=error)
 
         if turn is None:
@@ -195,6 +199,12 @@ class Engine:
 
         result = TurnResult(ok=False, model=model_id, session_id=turn.session_id,
                             transaction_id=turn.transaction_id)
+        # Opens the turn in the log so the three lines that can end it have something to close.
+        # The resolved id as well as the requested one: they differ whenever the catalog knows
+        # two spellings for one model, and only the resolved one reaches the transport.
+        log.debug("turn opened (model=%s, requested=%s, chars=%d, session=%s, txn=%s)",
+                  model_id, model or "-", len(message), turn.session_id or "-",
+                  turn.transaction_id)
         return message, turn, result
 
     def _opening_messages(self, message: str, system_prompt: str | None,
@@ -258,13 +268,27 @@ class Engine:
         result.latency_ms = latency
         if completion.usage:
             result.usage = completion.usage
+
+        # The third way a turn can end, and the one that used to end it in silence. A failed
+        # completion stops the turn here - before the response checkpoint, so the guardrail logs
+        # nothing either - and the only trace left was the error the caller got back over gRPC.
+        log.warning("turn failed: code=%s model=%s status=%s latency=%dms error=%s",
+                    result.code, result.model, completion.status or "-", latency,
+                    result.error or "no reason given")
         return result
 
     def _answer(self, result: TurnResult, completion: Completion, latency: int) -> TurnResult:
-        """Everything passed. This is the turn."""
+        """Everything passed. This is the turn.
+
+        Logged like the three failures above, so every turn closes with exactly one line
+        whichever way it went: a run with no `turn ...` line at the end is a turn still in
+        flight, rather than one that ended somewhere this file forgot to say so.
+        """
         result.ok = True
         result.reply = completion.text
         result.latency_ms = latency
+        log.info("turn answered: model=%s latency=%dms chars=%d verdicts=%d",
+                 result.model, latency, len(result.reply), len(result.verdicts))
         return result
 
     # -- the checkpoints ------------------------------------------------------------------

@@ -70,6 +70,12 @@ class AiGatewayTransport:
             # The gateway's own header name, kept as the gateway spells it.
             headers["x-portkey-trace-id"] = trace_id
 
+        # Symmetric with direct.py, and needed for the same reason: the SDK logs nothing either,
+        # so without this a gateway turn is as quiet as a direct one between the two scans.
+        log.debug("call (model=%s, base_url=%s, turns=%d, max_tokens=%d, timeout=%.1fs, trace=%s)",
+                  model_arg, self._base_url, len(messages_arg), max_tokens, self._timeout,
+                  trace_id or "-")
+
         started = time.monotonic()
         try:
             response = self._client.chat.completions.create(
@@ -85,12 +91,26 @@ class AiGatewayTransport:
             # a response we can read, a transport failure does not.
             doc, status, transport_error = _classify(exc)
             if transport_error:
+                latency_ms = int((time.monotonic() - started) * 1000)
+                log.warning("call failed (model=%s, base_url=%s, latency=%dms, timeout=%.1fs, "
+                            "error=%s)", model_arg, self._base_url, latency_ms, self._timeout,
+                            transport_error)
                 return Completion(ok=False, code="UNREACHABLE", error=transport_error,
-                                  model=model,
-                                  latency_ms=int((time.monotonic() - started) * 1000))
+                                  model=model, latency_ms=latency_ms)
 
         latency_ms = int((time.monotonic() - started) * 1000)
-        return _to_completion(doc, status, latency_ms, model)
+        completion = _to_completion(doc, status, latency_ms, model)
+        if completion.ok:
+            # hook_results is the gateway's inline verdict; whether one rode along decides what
+            # the RESPONSE checkpoint has to work with, so its presence is worth a word here.
+            log.debug("call ok (model=%s, status=%s, latency=%dms, finish=%s, hooks=%s)",
+                      completion.model, status, latency_ms, completion.finish_reason or "-",
+                      "yes" if doc.get("hook_results") else "no")
+        else:
+            log.warning("call returned a failure (model=%s, status=%s, code=%s, latency=%dms, "
+                        "error=%s)", model_arg, status, completion.code, latency_ms,
+                        completion.error)
+        return completion
 
 
 def _classify(exc: Exception) -> tuple[dict[str, Any], int, str]:

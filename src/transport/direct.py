@@ -116,6 +116,9 @@ class DirectTransport:
                  max_tokens: int = 4096, trace_id: str = "") -> Completion:
         endpoint, error = self.endpoint_for(model)
         if endpoint is None:
+            # Nothing is sent, so nothing times out and nothing appears in a packet capture.
+            # Said out loud here or this failure is indistinguishable from a silent one.
+            log.warning("call refused before it left (model=%s, error=%s)", model, error)
             return Completion(ok=False, code="BAD_ROUTE", error=error, model=model)
 
         body = build_body(model, messages,
@@ -129,15 +132,39 @@ class DirectTransport:
                    **endpoint.auth()}
 
         """ POST """
+        # urllib logs nothing on its own - unlike the AIRS SDK, whose urllib3 chatter is the only
+        # transport traffic that shows up by default. Without these two lines a turn goes quiet
+        # between the prompt scan and whatever the engine says next, which reads as "the model was
+        # never called" when it was called and did not answer.
+        log.debug("call (model=%s, url=%s, turns=%d, max_tokens=%d, timeout=%.1fs, trace=%s)",
+                  body["model"], endpoint.url, len(body["messages"]), max_tokens,
+                  self._timeout, trace_id or "-")
+
         started = time.monotonic()
         status, doc, transport_error = self._post(endpoint.url, body, headers)
         latency_ms = int((time.monotonic() - started) * 1000)
 
         if transport_error:
+            # The timeout is in the message on purpose: a read that gave up at the cap and a
+            # connection that was refused both land here, and the latency next to the cap is what
+            # tells them apart at a glance.
+            log.warning("call failed (model=%s, url=%s, latency=%dms, timeout=%.1fs, error=%s)",
+                        body["model"], endpoint.url, latency_ms, self._timeout, transport_error)
             return Completion(ok=False, code="UNREACHABLE", error=transport_error,
                               model=model, latency_ms=latency_ms)
 
-        return _to_completion(doc, status, latency_ms, model)
+        completion = _to_completion(doc, status, latency_ms, model)
+        if completion.ok:
+            log.debug("call ok (model=%s, status=%s, latency=%dms, finish=%s, usage=%s)",
+                      completion.model, status, latency_ms, completion.finish_reason or "-",
+                      completion.usage or "{}")
+        else:
+            # A 4xx/5xx or a document this code could not read. The provider answered, so this is
+            # a different failure from the one above and says so.
+            log.warning("call returned a failure (model=%s, status=%s, code=%s, latency=%dms, "
+                        "error=%s)", body["model"], status, completion.code, latency_ms,
+                        completion.error)
+        return completion
 
     def _post(self, url: str, body: dict[str, Any],
               headers: dict[str, str]) -> tuple[int, dict[str, Any], str]:

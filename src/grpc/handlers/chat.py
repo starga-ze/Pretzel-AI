@@ -150,6 +150,10 @@ class ChatHandlers:
         # a second place the deployment matrix is decided, and the two would drift.
         engine = self.get_engine(CHAT)
         if engine is None:
+            # Ends the turn before the engine can log anything about it, so it is logged here or
+            # nowhere: a console asking an appliance that was never configured.
+            log.warning("chat turn refused: no chat service is built (session=%s, txn=%s)",
+                        request.session_id or "-", request.transaction_id or "-")
             yield pretzel_ai_pb2.ChatChunk(done=True, error=_UNCONFIGURED)
             return
 
